@@ -1,0 +1,17 @@
+{
+    "history": [
+        {
+            "role": "user",
+            "content": "hola"
+        },
+        {
+            "role": "assistant",
+            "content": "¡Bienvenido! Es un placer recibirlo. ¿Ya ha usado la plataforma antes?"
+        }
+    ],
+    "formData": [],
+    "awaitingConfirmation": false,
+    "mode": "recepcionista",
+    "userData": null,
+    "updated_at": 1772829473
+}

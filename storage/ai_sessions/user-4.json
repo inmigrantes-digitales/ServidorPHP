@@ -1,0 +1,97 @@
+{
+    "history": [
+        {
+            "role": "user",
+            "content": "cual es el problema"
+        },
+        {
+            "role": "assistant",
+            "content": "No encontré su cuenta en nuestro sistema. ¿Es la primera vez que usa nuestro servicio?"
+        },
+        {
+            "role": "user",
+            "content": "si"
+        },
+        {
+            "role": "assistant",
+            "content": "¡Bienvenido! Es un placer recibirlo. Como es su primera vez, necesito derivarlo a nuestro formulario de registro para crearle una cuenta. ¿Le parece bien?\n\nAhora necesito algunos datos para crear su cuenta. Empecemos..."
+        },
+        {
+            "role": "user",
+            "content": "dale"
+        },
+        {
+            "role": "assistant",
+            "content": "¡Genial! Ahora necesito saber su nombre y apellido para crear su cuenta. Por favor, ingrese su nombre completo."
+        },
+        {
+            "role": "user",
+            "content": "facundo mateo"
+        },
+        {
+            "role": "assistant",
+            "content": "Genial! Usted ha ingresado su nombre correctamente. Ahora, necesito su dirección para crear su cuenta."
+        },
+        {
+            "role": "user",
+            "content": "que direccion?"
+        },
+        {
+            "role": "assistant",
+            "content": "Me parece que tiene dudas sobre la dirección. ¿Puedo pedirle que me proporcione la calle y la altura numérica de su hogar?"
+        },
+        {
+            "role": "user",
+            "content": "ñoperez 1321"
+        },
+        {
+            "role": "assistant",
+            "content": "Genial, gracias por la dirección. Parece que la calle es ñoperez y la altura es 1321. ¿Podría decirme qué barrio o zona se encuentra en ese lugar?"
+        },
+        {
+            "role": "user",
+            "content": "palermo"
+        },
+        {
+            "role": "user",
+            "content": "es de palermo"
+        },
+        {
+            "role": "assistant",
+            "content": "Usted ha confirmado que se encuentra en Palermo. Ahora necesito su número de teléfono para completar su registro."
+        },
+        {
+            "role": "user",
+            "content": "115647123"
+        },
+        {
+            "role": "assistant",
+            "content": "Genial, gracias por su número de teléfono. Ahora tengo todos los datos necesarios para su registro."
+        },
+        {
+            "role": "user",
+            "content": "genial"
+        },
+        {
+            "role": "user",
+            "content": "genial"
+        },
+        {
+            "role": "assistant",
+            "content": "Usted ya ha proporcionado toda la información necesaria. Ahora, revise el resumen de su registro para asegurarse de que todo esté correcto."
+        }
+    ],
+    "formData": {
+        "dni": "28456789",
+        "name": "facundo mateo",
+        "address": "ñoperez 1321",
+        "zone": "palermo",
+        "phone": "115647123"
+    },
+    "awaitingConfirmation": true,
+    "mode": "formulario",
+    "userData": {
+        "dni": "28456789"
+    },
+    "updated_at": 1772821653
+}
