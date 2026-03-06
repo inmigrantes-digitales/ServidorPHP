@@ -334,27 +334,29 @@ mysql -u usuario -p acceso_senior < schema/acceso_senior_v2.sql
 
 O importar desde phpMyAdmin usando el archivo `schema/acceso_senior_v2.sql`.
 
-#### 3. Configurar credenciales
+#### 3. Configurar variables de entorno
 
-Editar `config/database.php`:
+Copiar `.env.example` como `.env` en la raíz del proyecto y completar valores reales:
 
-```php
-define('DB_HOST', 'localhost');
-define('DB_NAME', 'acceso_senior');
-define('DB_USER', 'tu_usuario_mysql');
-define('DB_PASS', 'tu_contraseña_mysql');
+```env
+DB_HOST=localhost
+DB_NAME=acceso_senior
+DB_USER=tu_usuario_mysql
+DB_PASS=tu_contrasena_mysql
+DB_CHARSET=utf8mb4
 
-define('JWT_SECRET', 'cambiar-por-un-secreto-largo-y-aleatorio');
+JWT_SECRET=secreto_largo_y_aleatorio
+JWT_EXPIRATION=604800
 
-define('GROQ_API_KEY', 'gsk_...');    // Opcional
-define('GEMINI_API_KEY', 'AIza...');   // Opcional
+CORS_ORIGIN=https://tu-frontend.com
+
+GROQ_API_KEY=
+GEMINI_API_KEY=
 ```
 
-Editar `config/cors.php` si el frontend está en otro dominio:
-
-```php
-define('CORS_ORIGIN', 'https://tu-frontend.com');
-```
+Notas:
+- En producción, evitar `CORS_ORIGIN=*`.
+- No commitear nunca `.env` (ya está excluido en `.gitignore`).
 
 #### 4. Permisos de carpetas
 

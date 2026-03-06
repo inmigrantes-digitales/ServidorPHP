@@ -1,0 +1,5 @@
+# Secretos locales
+.env
+
+# Archivos de sesion IA runtime
+storage/ai_sessions/*.json
