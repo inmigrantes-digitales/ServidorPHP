@@ -83,7 +83,7 @@ $routes = [
     ['POST', '#^/api/centers$#', 'api/centers/create.php'],
 
     // ── Problem Types (URL con guión para compatibilidad con Node.js) ──
-    ['GET',  '#^/api/problem-types$#', 'api/problem_types/list.php'],
+    ['GET',  '#^/problem-types$#', 'api/problem_types/list.php'],
     ['POST', '#^/api/problem-types$#', 'api/problem_types/create.php'],
 
     // ── Asistente IA ──
