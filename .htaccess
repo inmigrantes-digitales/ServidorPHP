@@ -1,8 +1,5 @@
 RewriteEngine On
 
-# Hosting en subdirectorio /back
-RewriteBase /back/
-
 # Si el archivo o directorio existe físicamente, servirlo directamente
 RewriteCond %{REQUEST_FILENAME} !-f
 RewriteCond %{REQUEST_FILENAME} !-d
