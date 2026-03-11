@@ -48,7 +48,7 @@ $result = runAgent([
     'history'         => $session['history'],
     'model'           => [
         'provider'    => !empty(GROQ_API_KEY) ? 'groq' : 'gemini',
-        'name'        => !empty(GROQ_API_KEY) ? 'llama-3.1-8b-instant' : 'gemini-2.0-flash-exp',
+        'name'        => !empty(GROQ_API_KEY) ? 'llama-3.1-8b-instant' : GEMINI_MODEL,
         'temperature' => 0.7,
     ],
     'stream'  => false,

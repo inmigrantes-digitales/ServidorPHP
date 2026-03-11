@@ -113,6 +113,59 @@ function callGemini(array $messages, string $model, float $temperature = 0.7, bo
         throw new RuntimeException('GEMINI_API_KEY no configurada');
     }
 
+    $candidates = [$model];
+
+    // Muchos modelos experimentales terminan en "-exp" y pueden no estar disponibles.
+    if (str_ends_with($model, '-exp')) {
+        $candidates[] = substr($model, 0, -4);
+    }
+
+    // Fallback estable para evitar 404 por modelo no encontrado.
+    $candidates[] = 'gemini-1.5-flash';
+    $candidates = array_values(array_unique(array_filter($candidates)));
+
+    $lastException = null;
+    $lastIndex = count($candidates) - 1;
+
+    foreach ($candidates as $index => $candidateModel) {
+        try {
+            return callGeminiRequest($messages, $candidateModel, $temperature, $stream, $onToken);
+        } catch (RuntimeException $e) {
+            $lastException = $e;
+
+            // Reintentar solo para "model not found" (HTTP 404).
+            if (stripos($e->getMessage(), 'HTTP 404') !== false && $index < $lastIndex) {
+                error_log("[Gemini] Modelo no encontrado: {$candidateModel}. Reintentando con fallback...");
+                continue;
+            }
+
+            throw $e;
+        }
+    }
+
+    throw $lastException ?? new RuntimeException('Error desconocido al llamar a Gemini');
+}
+
+/**
+ * Ejecuta una llamada Gemini con un modelo específico.
+ */
+function callGeminiRequest(array $messages, string $model, float $temperature = 0.7, bool $stream = false, ?callable $onToken = null): string
+{
+    if (empty(GEMINI_API_KEY)) {
+        throw new RuntimeException('GEMINI_API_KEY no configurada');
+    }
+
+    // El streaming nativo de Gemini puede llegar en fragmentos JSON parciales y
+    // terminar duplicando texto al parsearlo manualmente. Para estabilidad,
+    // pedimos respuesta completa y la reenviamos como un unico chunk SSE.
+    if ($stream && $onToken !== null) {
+        $fullText = callGeminiRequest($messages, $model, $temperature, false, null);
+        if ($fullText !== '') {
+            $onToken($fullText);
+        }
+        return $fullText;
+    }
+
     // Convertir formato OpenAI a formato Gemini
     $systemInstruction = '';
     $contents = [];

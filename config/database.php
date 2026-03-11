@@ -86,6 +86,7 @@ define('JWT_EXPIRATION', (int) envValue('JWT_EXPIRATION', (string) (60 * 60 * 24
 // ── API Keys para servicios de IA (dejar vacío si no se usa) ──
 define('GROQ_API_KEY', envValue('GROQ_API_KEY', ''));
 define('GEMINI_API_KEY', envValue('GEMINI_API_KEY', ''));
+define('GEMINI_MODEL', envValue('GEMINI_MODEL', 'gemini-3-flash-preview'));
 
 // ── CORS ──
 define('CORS_ORIGIN', envValue('CORS_ORIGIN', '*')); // En producción: 'https://tudominio.com'
