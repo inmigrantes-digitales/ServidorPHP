@@ -86,7 +86,12 @@ define('JWT_EXPIRATION', (int) envValue('JWT_EXPIRATION', (string) (60 * 60 * 24
 // ── API Keys para servicios de IA (dejar vacío si no se usa) ──
 define('GROQ_API_KEY', envValue('GROQ_API_KEY', ''));
 define('GEMINI_API_KEY', envValue('GEMINI_API_KEY', ''));
-define('GEMINI_MODEL', envValue('GEMINI_MODEL', 'gemini-3-flash-preview'));
+define('GEMINI_MODEL', envValue('GEMINI_MODEL', 'gemini-1.5-flash'));
+
+// Timeouts para llamadas a proveedores LLM (en segundos)
+define('LLM_TIMEOUT', (int) envValue('LLM_TIMEOUT', '90'));
+define('LLM_CONNECT_TIMEOUT', (int) envValue('LLM_CONNECT_TIMEOUT', '20'));
+define('LLM_MAX_RETRIES', (int) envValue('LLM_MAX_RETRIES', '2'));
 
 // ── CORS ──
 define('CORS_ORIGIN', envValue('CORS_ORIGIN', '*')); // En producción: 'https://tudominio.com'

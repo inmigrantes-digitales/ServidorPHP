@@ -19,6 +19,8 @@
  */
 function classifyLLMError(int $httpCode, string $errorMsg, string $provider): array
 {
+    $msg = strtolower($errorMsg);
+
     if ($httpCode === 429 || stripos($errorMsg, 'rate limit') !== false) {
         return [
             'type'       => 'RATE_LIMIT',
@@ -51,10 +53,17 @@ function classifyLLMError(int $httpCode, string $errorMsg, string $provider): ar
             'statusCode' => 400,
         ];
     }
-    if (stripos($errorMsg, 'Could not resolve') !== false || stripos($errorMsg, 'timed out') !== false) {
+    if (
+        str_contains($msg, 'could not resolve')
+        || str_contains($msg, 'timed out')
+        || str_contains($msg, 'timeout')
+        || str_contains($msg, 'connection')
+        || str_contains($msg, 'conex')
+        || str_contains($msg, 'network')
+    ) {
         return [
             'type'       => 'NETWORK_ERROR',
-            'message'    => "Error de conexión con $provider.",
+            'message'    => "Error de conexión con $provider: $errorMsg",
             'retryable'  => true,
             'statusCode' => 0,
         ];
@@ -197,13 +206,18 @@ function callGeminiRequest(array $messages, string $model, float $temperature = 
     }
     $payload['generationConfig'] = ['temperature' => $temperature];
 
+    $timeout = (defined('LLM_TIMEOUT') && LLM_TIMEOUT > 0) ? LLM_TIMEOUT : 90;
+    $connectTimeout = (defined('LLM_CONNECT_TIMEOUT') && LLM_CONNECT_TIMEOUT > 0) ? LLM_CONNECT_TIMEOUT : 20;
+
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_POST           => true,
         CURLOPT_POSTFIELDS     => json_encode($payload),
         CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
-        CURLOPT_TIMEOUT        => 60,
-        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_CONNECTTIMEOUT => $connectTimeout,
+        // En algunos hostings compartidos, IPv6 causa timeouts intermitentes.
+        CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,
     ]);
 
     if ($stream && $onToken !== null) {
@@ -276,6 +290,9 @@ function callGeminiRequest(array $messages, string $model, float $temperature = 
  */
 function callOpenAICompatible(string $url, string $apiKey, array $payload, bool $stream, ?callable $onToken, string $provider): string
 {
+    $timeout = (defined('LLM_TIMEOUT') && LLM_TIMEOUT > 0) ? LLM_TIMEOUT : 90;
+    $connectTimeout = (defined('LLM_CONNECT_TIMEOUT') && LLM_CONNECT_TIMEOUT > 0) ? LLM_CONNECT_TIMEOUT : 20;
+
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_POST           => true,
@@ -284,8 +301,10 @@ function callOpenAICompatible(string $url, string $apiKey, array $payload, bool 
             'Content-Type: application/json',
             'Authorization: Bearer ' . $apiKey,
         ],
-        CURLOPT_TIMEOUT        => 60,
-        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_CONNECTTIMEOUT => $connectTimeout,
+        // En algunos hostings compartidos, IPv6 causa timeouts intermitentes.
+        CURLOPT_IPRESOLVE      => CURL_IPRESOLVE_V4,
     ]);
 
     if ($stream && $onToken !== null) {
@@ -368,7 +387,7 @@ function callLLM(array $params): string
     $model       = $params['model'];
     $stream      = $params['stream'] ?? false;
     $onToken     = $params['onToken'] ?? null;
-    $maxRetries  = $params['maxRetries'] ?? 2;
+    $maxRetries  = $params['maxRetries'] ?? (defined('LLM_MAX_RETRIES') ? LLM_MAX_RETRIES : 2);
     $temperature = $model['temperature'] ?? 0.7;
 
     $lastException = null;
