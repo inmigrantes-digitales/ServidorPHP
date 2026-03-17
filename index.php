@@ -50,6 +50,13 @@ if (
 // Normalizar: siempre empieza con /, sin trailing slash (excepto raíz)
 $path = '/' . trim($path, '/');
 
+// Si la app está desplegada dentro de /api, al remover el subdirectorio
+// el path queda como /problem-types, /auth/login, etc. Internamente todas
+// las rutas están definidas con prefijo /api, así que lo restauramos.
+if ($path !== '/' && !str_starts_with($path, '/api/')) {
+    $path = '/api' . $path;
+}
+
 // Variable global para parámetros de ruta extraídos
 $routeParams = [];
 
