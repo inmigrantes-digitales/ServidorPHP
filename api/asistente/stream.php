@@ -3,13 +3,15 @@
  * GET /api/asistente/stream
  *
  * Endpoint principal del asistente conversacional con streaming SSE.
- * Implementa dos modos:
- *   1. Recepcionista: Identifica si el usuario es nuevo o existente.
- *   2. Formulario: Recopila datos para crear usuario y caso.
+ * Usa un solo agente LLM que maneja todo el flujo:
+ *   - Identificación de usuario (DNI)
+ *   - Registro de usuario nuevo
+ *   - Creación de ticket/caso
+ *
+ * El campo "action" en la respuesta JSON del LLM determina qué
+ * operación de base de datos ejecuta el backend.
  *
  * Query params: ?sessionId=xxx&message=xxx
- *
- * Portado desde: src/controllers/test.chatStream.controller.js
  */
 
 // ── Dependencias ──
@@ -21,8 +23,7 @@ require_once $baseDir . '/ia/json_extractor.php';
 require_once $baseDir . '/ia/llm_client.php';
 require_once $baseDir . '/ia/session_manager.php';
 require_once $baseDir . '/ia/run_agent.php';
-require_once $baseDir . '/prompts/prompt_formulario.php';
-require_once $baseDir . '/prompts/prompt_identidad.php';
+require_once $baseDir . '/prompts/prompt.php';
 
 // ── Parámetros ──
 $sessionId = $_GET['sessionId'] ?? '';
@@ -36,9 +37,8 @@ if (empty($sessionId) || empty($message)) {
 header('Content-Type: text/event-stream; charset=utf-8');
 header('Cache-Control: no-cache');
 header('Connection: keep-alive');
-header('X-Accel-Buffering: no'); // Nginx: desactivar buffering
+header('X-Accel-Buffering: no');
 
-// Desactivar buffering de PHP para streaming real
 if (ob_get_level()) ob_end_clean();
 ini_set('output_buffering', 'off');
 ini_set('zlib.output_compression', false);
@@ -61,25 +61,71 @@ $session = getAISession($sessionId);
 addToHistory($session, 'user', $message);
 
 try {
-    // ── Determinar modo actual ──
-    $mode = $session['mode'] ?? 'recepcionista';
+    // ── Manejar confirmación pendiente ──
+    if (!empty($session['awaitingConfirmation'])) {
+        $confirmation = detectUserConfirmation($message);
 
-    if ($mode === 'recepcionista') {
-        handleRecepcionistaMode($session, $message, $sessionId);
-    } else {
-        handleFormularioMode($session, $message, $sessionId);
+        if ($confirmation === true) {
+            // Usuario confirmó → ejecutar la acción pendiente
+            $result = executeConfirmedAction($session, $sessionId);
+            addToHistory($session, 'assistant', $result['assistant']['message']);
+            sendSSE('__JSON__START__' . json_encode($result, JSON_UNESCAPED_UNICODE));
+            $session['awaitingConfirmation'] = false;
+            $session['lastAction'] = 'finish';
+            saveAISession($sessionId, $session);
+            exit;
+        } elseif ($confirmation === false) {
+            // Usuario rechazó → continuar recopilando
+            $session['awaitingConfirmation'] = false;
+        }
+        // null = indeterminado → dejar que el LLM interprete
     }
+
+    // ── Construir contexto para el prompt ──
+    $promptContext = [
+        'userData'    => $session['userData'] ?? [],
+        'problemData' => $session['problemData'] ?? [],
+        'dbUser'      => $session['dbUser'] ?? null,
+    ];
+
+    // ── Llamar al LLM con streaming ──
+    // Excluir el último mensaje del historial (es el actual) para no duplicarlo
+    $historyForLLM = array_slice($session['history'], 0, -1);
+
+    $result = runAgent([
+        'userMessage'    => $message,
+        'sessionContext' => $promptContext,
+        'history'        => $historyForLLM,
+        'model'          => [
+            'provider'    => !empty(GROQ_API_KEY) ? 'groq' : 'gemini',
+            'name'        => !empty(GROQ_API_KEY) ? 'llama-3.1-8b-instant' : GEMINI_MODEL,
+            'temperature' => 0.4,
+        ],
+        'stream'  => true,
+        'onToken' => function (string $text) {
+            sendSSE($text);
+        },
+    ]);
+
+    $parsed = $result['parsed'];
+
+    // ── Actualizar datos de sesión con lo que extrajo el LLM ──
+    $update = $parsed['data']['update'] ?? [];
+    mergeSessionData($session, $update);
+
+    // ── Dispatch de acciones de BD ──
+    $action = $parsed['action'] ?? 'ask_dni';
+    $parsed = handleAction($action, $parsed, $session, $sessionId);
+
+    // ── Guardar estado ──
+    $session['lastAction'] = $action;
+    addToHistory($session, 'assistant', $parsed['assistant']['message']);
+    sendSSE('__JSON__START__' . json_encode($parsed, JSON_UNESCAPED_UNICODE));
+
 } catch (Exception $e) {
     error_log("Error en asistente SSE: " . $e->getMessage());
-    sendSSE('__JSON__START__' . json_encode([
-        'assistant_message'  => 'Disculpe, hubo un error interno. Por favor, intente nuevamente.',
-        'update_json'        => new stdClass(),
-        'missing_info'       => [],
-        'need_confirmation'  => false,
-        'user_confirmed'     => false,
-        'process_finished'   => false,
-        'form_summary'       => null,
-    ], JSON_UNESCAPED_UNICODE));
+    $fallback = buildFallbackResponse('Disculpe, hubo un error interno. Por favor, intente nuevamente.');
+    sendSSE('__JSON__START__' . json_encode($fallback, JSON_UNESCAPED_UNICODE));
 }
 
 // ── Guardar sesión actualizada ──
@@ -87,294 +133,210 @@ saveAISession($sessionId, $session);
 exit;
 
 /* ============================================================
-   MODO RECEPCIONISTA
+   DISPATCH DE ACCIONES
    ============================================================ */
-function handleRecepcionistaMode(array &$session, string $message, string $sessionId): void
+
+/**
+ * Ejecuta la acción indicada por el LLM contra la base de datos.
+ */
+function handleAction(string $action, array $parsed, array &$session, string $sessionId): array
 {
-    $prompt = getPromptIdentidadUsuario();
+    switch ($action) {
+        case 'check_user':
+            return handleCheckUser($parsed, $session);
 
-    // Construir prompt completo con historial y datos actuales
-    $fullPrompt = $prompt . "\n\nHistorial de la conversación:\n"
-        . json_encode(array_slice($session['history'], -10), JSON_UNESCAPED_UNICODE)
-        . "\n\nDatos recopilados hasta ahora:\n"
-        . json_encode($session['userData'] ?? new stdClass(), JSON_UNESCAPED_UNICODE)
-        . "\n\nNuevo mensaje del usuario:\n\"{$message}\""
-        . "\n\nINSTRUCCIONES:\n- Analiza el mensaje y determina si el usuario es nuevo o tiene cuenta.\n"
-        . "- Si el usuario proporciona DNI, verifica en tu respuesta si parece válido.\n"
-        . "- Responde siempre con el JSON especificado en el prompt.";
+        case 'register_user':
+        case 'update_user_data':
+            // Solo acumular datos — ya se hizo en mergeSessionData
+            return $parsed;
 
-    $messages = [
-        ['role' => 'system', 'content' => $prompt],
-        ['role' => 'user',   'content' => $fullPrompt],
-    ];
+        case 'confirm_data':
+            $session['awaitingConfirmation'] = true;
+            // Incluir resumen de datos en la respuesta
+            $parsed['data']['summary'] = buildDataSummary($session);
+            return $parsed;
 
-    // Llamar al LLM con streaming
-    $fullText = '';
+        case 'create_ticket':
+            return handleCreateTicket($parsed, $session, $sessionId);
+
+        case 'finish':
+            $parsed['process']['suggest_finish'] = true;
+            return $parsed;
+
+        case 'ask_dni':
+        case 'ask_problem':
+        default:
+            return $parsed;
+    }
+}
+
+/**
+ * Busca un usuario por DNI en la base de datos.
+ */
+function handleCheckUser(array $parsed, array &$session): array
+{
+    $dni = $parsed['data']['update']['dni'] ?? $session['userData']['dni'] ?? null;
+
+    if (empty($dni)) {
+        $parsed['assistant']['message'] = 'Disculpe, no pude identificar su número de DNI. ¿Podría indicármelo nuevamente?';
+        $parsed['action'] = 'ask_dni';
+        return $parsed;
+    }
+
+    $dniClean = preg_replace('/\D/', '', $dni);
+    if (strlen($dniClean) < 7) {
+        $parsed['assistant']['message'] = 'El DNI que ingresó no parece válido. Debe tener entre 7 y 8 dígitos. ¿Podría verificarlo?';
+        $parsed['action'] = 'ask_dni';
+        $parsed['validation']['invalid_fields'][] = 'dni';
+        return $parsed;
+    }
+
+    // Guardar DNI limpio en sesión
+    $session['userData']['dni'] = $dniClean;
+
+    // Buscar en BD
+    $dbUser = findUserByDni($dniClean);
+
+    if ($dbUser) {
+        // Usuario encontrado
+        $session['dbUser'] = $dbUser;
+        $parsed['assistant']['message'] = "¡Bienvenido/a de nuevo, {$dbUser['name']}! ¿En qué puedo ayudarle hoy? Cuénteme su problema o consulta.";
+        $parsed['action'] = 'ask_problem';
+        $parsed['data']['update']['dni'] = $dniClean;
+        $parsed['data']['update']['nombre'] = $dbUser['name'];
+    } else {
+        // Usuario no encontrado
+        $session['dbUser'] = null;
+        $parsed['assistant']['message'] = 'No encontré una cuenta con ese DNI en nuestro sistema. No se preocupe, vamos a registrarlo. ¿Podría decirme su nombre completo (nombre y apellido)?';
+        $parsed['action'] = 'register_user';
+        $parsed['validation']['missing_fields'] = ['nombre', 'telefono'];
+    }
+
+    return $parsed;
+}
+
+/**
+ * Crea el ticket/caso en la base de datos.
+ */
+function handleCreateTicket(array $parsed, array &$session, string $sessionId): array
+{
+    $dbUser      = $session['dbUser'] ?? null;
+    $userData    = $session['userData'] ?? [];
+    $problemData = $session['problemData'] ?? [];
+    $descripcion = $problemData['descripcion'] ?? $parsed['data']['update']['descripcion'] ?? null;
+
     try {
-        $fullText = callLLM([
-            'messages' => $messages,
-            'model'    => [
-                'provider'    => !empty(GROQ_API_KEY) ? 'groq' : 'gemini',
-                'name'        => !empty(GROQ_API_KEY) ? 'llama-3.1-8b-instant' : GEMINI_MODEL,
-                'temperature' => 0.7,
-            ],
-            'stream'  => true,
-            'onToken' => function (string $text) {
-                sendSSE($text);
-            },
-        ]);
-    } catch (RuntimeException $e) {
-        error_log("Error LLM recepcionista: " . $e->getMessage());
-        $fallback = [
-            'assistant_message' => 'Disculpe, hubo un error. ¿Podría repetir su mensaje?',
-            'data'              => ['dni' => null, 'description' => null],
-            'status'            => ['is_new_user' => false, 'has_dni' => false, 'has_description' => false],
-            'action_needed'     => 'continue',
-            'process_finished'  => false,
-        ];
-        sendSSE('__JSON__START__' . json_encode($fallback, JSON_UNESCAPED_UNICODE));
-        return;
-    }
-
-    // Parsear respuesta JSON
-    $parsed = extractFirstJSON($fullText);
-
-    if (!$parsed) {
-        $fallback = [
-            'assistant_message' => 'Disculpe, hubo un error. ¿Podría repetir su mensaje?',
-            'data'              => ['dni' => null, 'description' => null],
-            'status'            => ['is_new_user' => false, 'has_dni' => false, 'has_description' => false],
-            'action_needed'     => 'continue',
-            'process_finished'  => false,
-        ];
-        sendSSE('__JSON__START__' . json_encode($fallback, JSON_UNESCAPED_UNICODE));
-        return;
-    }
-
-    // Normalizar estructura
-    if (empty($parsed['assistant_message'])) $parsed['assistant_message'] = 'Disculpe, no pude procesar su mensaje.';
-    if (empty($parsed['data'])) $parsed['data'] = ['dni' => null, 'description' => null];
-    if (empty($parsed['status'])) $parsed['status'] = ['is_new_user' => false, 'has_dni' => false, 'has_description' => false];
-    if (empty($parsed['action_needed'])) $parsed['action_needed'] = 'continue';
-    if (!isset($parsed['process_finished'])) $parsed['process_finished'] = false;
-
-    // Actualizar datos de sesión
-    if (!empty($parsed['data']['dni'])) {
-        $session['userData'] = $session['userData'] ?? [];
-        $session['userData']['dni'] = $parsed['data']['dni'];
-    }
-    if (!empty($parsed['data']['description'])) {
-        $session['userData'] = $session['userData'] ?? [];
-        $session['userData']['description'] = $parsed['data']['description'];
-    }
-
-    // Manejar acciones
-    if ($parsed['action_needed'] === 'register_new_user') {
-        // Usuario nuevo → cambiar a modo formulario
-        $session['mode'] = 'formulario';
-        $parsed['assistant_message'] .= "\n\nAhora necesito algunos datos para crear su cuenta. Empecemos...";
-        $parsed['mode_changed'] = true;
-        $parsed['new_mode'] = 'formulario';
-
-    } elseif ($parsed['action_needed'] === 'save_problem') {
-        // Usuario existente con DNI + descripción → verificar BD y guardar
-        $dni         = $parsed['data']['dni'] ?? null;
-        $description = $parsed['data']['description'] ?? null;
-
-        if ($dni && $description) {
-            $existingUser = checkUserExistsByDni($dni);
-
-            if ($existingUser) {
-                try {
-                    $caseId = saveUserProblemToDB($existingUser['id'], $description, $sessionId);
-                    $parsed['assistant_message'] = "¡Perfecto {$existingUser['name']}! He registrado su consulta sobre: \"{$description}\". En breve un facilitador se pondrá en contacto con usted para ayudarlo. ¡Que tenga un excelente día!";
-                    $parsed['process_finished'] = true;
-                    $session['userData']['userId'] = $existingUser['id'];
-                } catch (Exception $e) {
-                    error_log("Error guardando problema: " . $e->getMessage());
-                    $parsed['assistant_message'] = 'Disculpe, hubo un error al guardar su consulta. Por favor, intente nuevamente.';
-                    $parsed['action_needed'] = 'continue';
-                    $parsed['process_finished'] = false;
-                }
-            } else {
-                // Usuario no encontrado → derivar a formulario
-                $parsed['assistant_message'] = 'No encontré su cuenta en nuestro sistema. Necesito crearle una cuenta primero. Por favor, proporcione sus datos...';
-                $session['mode'] = 'formulario';
-                $parsed['mode_changed'] = true;
-                $parsed['new_mode'] = 'formulario';
-                $parsed['action_needed'] = 'register_new_user';
-                $parsed['process_finished'] = false;
-            }
-        }
-    } elseif (!empty($parsed['status']['has_dni']) && !empty($parsed['data']['dni'])) {
-        // Tenemos DNI → verificar en BD
-        $existingUser = checkUserExistsByDni($parsed['data']['dni']);
-        if ($existingUser) {
-            $session['userData'] = array_merge($session['userData'] ?? [], [
-                'userId' => $existingUser['id'],
-                'name'   => $existingUser['name'],
-            ]);
+        if ($dbUser && !empty($dbUser['id'])) {
+            // Usuario existente → solo crear caso
+            $caseId = saveExistingUserCase((int)$dbUser['id'], $descripcion, $sessionId);
+            $nombre = $dbUser['name'] ?? 'estimado/a';
         } else {
-            $parsed['assistant_message'] = 'No encontré su cuenta en nuestro sistema. ¿Es la primera vez que usa nuestro servicio?';
-            $parsed['status']['is_new_user'] = true;
+            // Usuario nuevo → crear usuario + caso
+            $result = saveNewUserAndCase($userData, $descripcion, $sessionId);
+            $caseId = $result['caseId'];
+            $session['dbUser'] = ['id' => $result['userId']];
+            $nombre = $userData['nombre'] ?? 'estimado/a';
         }
+
+        $parsed['assistant']['message'] = "¡Listo, {$nombre}! Su consulta ha sido registrada exitosamente (N° {$caseId}). "
+            . "En breve, un facilitador se pondrá en contacto con usted para ayudarlo. "
+            . "¡Que tenga un excelente día!";
+        $parsed['action'] = 'finish';
+        $parsed['process']['suggest_finish'] = true;
+
+    } catch (Exception $e) {
+        error_log("[{$sessionId}] Error creando ticket: " . $e->getMessage());
+        $parsed['assistant']['message'] = 'Disculpe, hubo un error al registrar su consulta. ¿Podría intentar nuevamente?';
+        $parsed['action'] = 'ask_problem';
+        $parsed['process']['can_continue'] = true;
     }
 
-    addToHistory($session, 'assistant', $parsed['assistant_message']);
-    sendSSE('__JSON__START__' . json_encode($parsed, JSON_UNESCAPED_UNICODE));
+    return $parsed;
+}
+
+/**
+ * Ejecuta la acción cuando el usuario confirma datos pendientes.
+ */
+function executeConfirmedAction(array &$session, string $sessionId): array
+{
+    $lastAction = $session['lastAction'] ?? 'confirm_data';
+    $userData    = $session['userData'] ?? [];
+    $problemData = $session['problemData'] ?? [];
+    $descripcion = $problemData['descripcion'] ?? '';
+    $dbUser      = $session['dbUser'] ?? null;
+
+    try {
+        if ($dbUser && !empty($dbUser['id'])) {
+            $caseId = saveExistingUserCase((int)$dbUser['id'], $descripcion, $sessionId);
+            $nombre = $dbUser['name'] ?? $userData['nombre'] ?? 'estimado/a';
+        } else {
+            $result = saveNewUserAndCase($userData, $descripcion, $sessionId);
+            $caseId = $result['caseId'];
+            $session['dbUser'] = ['id' => $result['userId']];
+            $nombre = $userData['nombre'] ?? 'estimado/a';
+        }
+
+        return buildFinalResponse($nombre, $caseId);
+
+    } catch (Exception $e) {
+        error_log("[{$sessionId}] Error en confirmación: " . $e->getMessage());
+        $response = buildFallbackResponse('Disculpe, hubo un error al guardar sus datos. ¿Podría intentar nuevamente?');
+        $response['action'] = 'confirm_data';
+        return $response;
+    }
 }
 
 /* ============================================================
-   MODO FORMULARIO
+   FUNCIONES AUXILIARES
    ============================================================ */
-function handleFormularioMode(array &$session, string $message, string $sessionId): void
+
+/**
+ * Merge de datos del LLM hacia la sesión (sin sobreescribir con null).
+ */
+function mergeSessionData(array &$session, array $update): void
 {
-    // Manejar confirmación pendiente
-    if (!empty($session['awaitingConfirmation'])) {
-        $confirmation = detectUserConfirmation($message);
-
-        if ($confirmation === true) {
-            // Usuario confirmó → guardar y finalizar
-            $response = [
-                'assistant_message'  => '¡Perfecto! Gracias por confirmar. Sus datos han sido cargados correctamente. En breve un facilitador se pondrá en contacto con usted para ayudarlo con su consulta. ¡Que tenga un hermoso día!',
-                'update_json'        => new stdClass(),
-                'missing_info'       => [],
-                'need_confirmation'  => false,
-                'user_confirmed'     => true,
-                'process_finished'   => true,
-                'form_summary'       => $session['formData'],
-            ];
-
-            addToHistory($session, 'assistant', $response['assistant_message']);
-            sendSSE('__JSON__START__' . json_encode($response, JSON_UNESCAPED_UNICODE));
-
-            $session['awaitingConfirmation'] = false;
-
-            // Guardar en BD
-            try {
-                saveFormDataToDB($session['formData'], $sessionId);
-            } catch (Exception $e) {
-                error_log("Error guardando formulario: " . $e->getMessage());
-            }
-
-            return;
-        } elseif ($confirmation === false) {
-            // Usuario rechazó → continuar recopilando
-            $session['awaitingConfirmation'] = false;
+    // Campos de usuario
+    $userFields = ['dni', 'nombre', 'telefono', 'email'];
+    foreach ($userFields as $field) {
+        if (!empty($update[$field])) {
+            $session['userData'][$field] = $update[$field];
         }
     }
 
-    // Validar campos actuales
-    $validation = validateRequiredFormFields($session['formData']);
+    // Campos de problema
+    $problemFields = ['descripcion', 'categoria'];
+    foreach ($problemFields as $field) {
+        if (!empty($update[$field])) {
+            $session['problemData'][$field] = $update[$field];
+        }
+    }
+}
 
-    // Construir prompt con contexto
-    $prompt = getPromptFormulario() . "\n\n"
-        . "Historial de la conversación:\n"
-        . json_encode(array_slice($session['history'], -10), JSON_UNESCAPED_UNICODE)
-        . "\n\nEstado actual del formulario:\n"
-        . json_encode($session['formData'], JSON_UNESCAPED_UNICODE)
-        . "\n\nCampos faltantes detectados: "
-        . (count($validation['missing']) > 0 ? json_encode($validation['missing']) : 'NINGUNO - Formulario completo')
-        . "\n\nNuevo mensaje del usuario:\n\"{$message}\""
-        . "\n\nINSTRUCCIONES ESPECÍFICAS:\n"
-        . "- Analiza el mensaje del usuario y extrae la información relevante.\n"
-        . "- Si el formulario está completo, marca 'need_confirmation' como true y muestra resumen.\n"
-        . "- Actualiza solo los campos que se mencionen en el mensaje del usuario.\n"
-        . "- Responde siempre con un JSON válido.";
-
-    $messages = [
-        ['role' => 'system', 'content' => getPromptFormulario()],
-        ['role' => 'user',   'content' => $prompt],
+/**
+ * Construye un resumen de datos para confirmación.
+ */
+function buildDataSummary(array $session): array
+{
+    return [
+        'usuario'  => $session['userData'] ?? [],
+        'problema' => $session['problemData'] ?? [],
+        'dbUser'   => $session['dbUser'] ?? null,
     ];
+}
 
-    // Llamar al LLM con streaming
-    $fullText = '';
-    try {
-        $fullText = callLLM([
-            'messages' => $messages,
-            'model'    => [
-                'provider'    => !empty(GROQ_API_KEY) ? 'groq' : 'gemini',
-                'name'        => !empty(GROQ_API_KEY) ? 'llama-3.1-8b-instant' : 'gemini-2.0-flash-exp',
-                'temperature' => 0.7,
-            ],
-            'stream'  => true,
-            'onToken' => function (string $text) {
-                sendSSE($text);
-            },
-        ]);
-    } catch (RuntimeException $e) {
-        error_log("Error LLM formulario: " . $e->getMessage());
-        sendSSE('__JSON__START__' . json_encode([
-            'assistant_message'  => 'Disculpe, hubo un error al interpretar la respuesta. ¿Podría repetir su mensaje?',
-            'update_json'        => new stdClass(),
-            'missing_info'       => $validation['missing'],
-            'need_confirmation'  => false,
-            'user_confirmed'     => false,
-            'process_finished'   => false,
-            'form_summary'       => null,
-        ], JSON_UNESCAPED_UNICODE));
-        return;
-    }
-
-    // Parsear respuesta
-    $parsed = extractFirstJSON($fullText);
-
-    if (!$parsed) {
-        sendSSE('__JSON__START__' . json_encode([
-            'assistant_message'  => 'Disculpe, hubo un error al interpretar la respuesta. ¿Podría repetir su mensaje?',
-            'update_json'        => new stdClass(),
-            'missing_info'       => $validation['missing'],
-            'need_confirmation'  => false,
-            'user_confirmed'     => false,
-            'process_finished'   => false,
-            'form_summary'       => null,
-        ], JSON_UNESCAPED_UNICODE));
-        return;
-    }
-
-    // Normalizar estructura
-    if (empty($parsed['assistant_message'])) $parsed['assistant_message'] = 'Disculpe, no pude procesar su mensaje correctamente.';
-    if (!isset($parsed['update_json'])) $parsed['update_json'] = [];
-    if (!isset($parsed['missing_info'])) $parsed['missing_info'] = [];
-    if (!isset($parsed['need_confirmation'])) $parsed['need_confirmation'] = false;
-    if (!isset($parsed['user_confirmed'])) $parsed['user_confirmed'] = false;
-    if (!isset($parsed['process_finished'])) $parsed['process_finished'] = false;
-
-    // Actualizar formData con los nuevos datos
-    if (!empty($parsed['update_json']) && is_array($parsed['update_json'])) {
-        $session['formData'] = array_merge($session['formData'], $parsed['update_json']);
-    }
-    // También manejar current_data (formato runAgent)
-    if (!empty($parsed['current_data']) && is_array($parsed['current_data'])) {
-        foreach ($parsed['current_data'] as $key => $value) {
-            if ($value !== null && $value !== '') {
-                $session['formData'][$key] = $value;
-            }
-        }
-    }
-
-    // Revalidar después de actualizar
-    $newValidation = validateRequiredFormFields($session['formData']);
-
-    // Si formulario completo → forzar confirmación
-    if ($newValidation['isValid'] && !$session['awaitingConfirmation'] && !$parsed['need_confirmation']) {
-        $parsed['need_confirmation'] = true;
-        $parsed['missing_info'] = [];
-        $parsed['form_summary'] = $session['formData'];
-        $session['awaitingConfirmation'] = true;
-    }
-
-    if ($parsed['need_confirmation'] && empty($parsed['form_summary'])) {
-        $parsed['form_summary'] = $session['formData'];
-        $session['awaitingConfirmation'] = true;
-    }
-
-    if (!$parsed['need_confirmation'] && !$parsed['process_finished']) {
-        $parsed['missing_info'] = $newValidation['missing'];
-    }
-
-    addToHistory($session, 'assistant', $parsed['assistant_message']);
-    sendSSE('__JSON__START__' . json_encode($parsed, JSON_UNESCAPED_UNICODE));
+/**
+ * Construye la respuesta final exitosa.
+ */
+function buildFinalResponse(string $nombre, int $caseId): array
+{
+    $response = buildFallbackResponse(
+        "¡Listo, {$nombre}! Su consulta ha sido registrada exitosamente (N° {$caseId}). "
+        . "En breve, un facilitador se pondrá en contacto con usted para ayudarlo. "
+        . "¡Que tenga un excelente día!"
+    );
+    $response['action'] = 'finish';
+    $response['process']['suggest_finish'] = true;
+    return $response;
 }
 
 /* ============================================================
@@ -382,101 +344,118 @@ function handleFormularioMode(array &$session, string $message, string $sessionI
    ============================================================ */
 
 /**
- * Busca un usuario por DNI (o por los últimos dígitos del teléfono como fallback).
+ * Busca un usuario por DNI en la base de datos.
  */
-function checkUserExistsByDni(string $dni): ?array
+function findUserByDni(string $dniClean): ?array
 {
     $pdo = getDB();
-    $dniClean = preg_replace('/\D/', '', $dni);
 
-    if (strlen($dniClean) < 7) {
-        return null;
-    }
-
-    // Buscar por campo DNI (si existe) o por teléfono como fallback
-    // Primero intentar por DNI directo
-    $stmt = $pdo->prepare('SELECT id, name, phone, email, role FROM users WHERE dni = ? LIMIT 1');
+    $stmt = $pdo->prepare('SELECT id, name, phone, email, role, dni FROM users WHERE dni = ? LIMIT 1');
     $stmt->execute([$dniClean]);
     $user = $stmt->fetch();
 
-    if ($user) {
-        return $user;
-    }
-
-    // Fallback: buscar por los últimos 8 dígitos del teléfono
-    $lastDigits = substr($dniClean, -8);
-    $stmt = $pdo->prepare('SELECT id, name, phone, email, role FROM users WHERE phone LIKE ? LIMIT 1');
-    $stmt->execute(['%' . $lastDigits]);
-    return $stmt->fetch() ?: null;
+    return $user ?: null;
 }
 
 /**
- * Guarda un problema para un usuario existente (crea un caso en la BD).
+ * Crea un caso para un usuario existente.
  */
-function saveUserProblemToDB(int $userId, string $description, string $sessionId): int
+function saveExistingUserCase(int $userId, ?string $description, string $sessionId): int
 {
     $pdo = getDB();
     $stmt = $pdo->prepare(
         "INSERT INTO cases (consultante_id, description, input_method, status, created_at)
          VALUES (?, ?, 'texto', 'ingresado', NOW())"
     );
-    $stmt->execute([$userId, $description]);
+    $stmt->execute([$userId, $description ?? '']);
     $caseId = (int)$pdo->lastInsertId();
 
-    error_log("[{$sessionId}] Problema guardado - Usuario ID: {$userId}, Caso ID: {$caseId}");
+    // Registrar en historial de caso
+    $stmt = $pdo->prepare(
+        "INSERT INTO case_history (case_id, user_id, action, comment, created_at)
+         VALUES (?, ?, 'caso_creado', 'Caso creado via asistente IA', NOW())"
+    );
+    $stmt->execute([$caseId, $userId]);
+
+    error_log("[{$sessionId}] Caso creado - Usuario ID: {$userId}, Caso ID: {$caseId}");
     return $caseId;
 }
 
 /**
- * Guarda los datos completos del formulario: crea o actualiza usuario + crea caso.
+ * Crea un usuario nuevo + caso en una transacción.
+ * Mapea campos del prompt (español) a columnas de BD (inglés).
  */
-function saveFormDataToDB(array $formData, string $sessionId): array
+function saveNewUserAndCase(array $userData, ?string $description, string $sessionId): array
 {
     $pdo = getDB();
 
-    $phoneClean = !empty($formData['phone']) ? preg_replace('/\D/', '', $formData['phone']) : null;
-    $name       = $formData['name'] ?? null;
-    $email      = $formData['email'] ?? null;
-    $zone       = $formData['zone'] ?? null;
-    $address    = $formData['address'] ?? null;
-    $description = $formData['description'] ?? '';
+    // Mapeo de campos: prompt → BD
+    $name     = $userData['nombre'] ?? null;
+    $dni      = !empty($userData['dni']) ? preg_replace('/\D/', '', $userData['dni']) : null;
+    $phone    = !empty($userData['telefono']) ? preg_replace('/\D/', '', $userData['telefono']) : null;
+    $email    = $userData['email'] ?? null;
 
-    // Verificar si el usuario ya existe por teléfono
-    $consultanteId = null;
-    if ($phoneClean) {
-        $stmt = $pdo->prepare('SELECT id FROM users WHERE phone = ? LIMIT 1');
-        $stmt->execute([$phoneClean]);
-        $existing = $stmt->fetch();
+    $pdo->beginTransaction();
 
-        if ($existing) {
-            $consultanteId = $existing['id'];
-            // Actualizar datos
-            $stmt = $pdo->prepare(
-                'UPDATE users SET name = ?, email = ?, zone = ?, address = ?, updated_at = NOW() WHERE id = ?'
-            );
-            $stmt->execute([$name, $email, $zone, $address, $consultanteId]);
+    try {
+        // Verificar si usuario ya existe por DNI o teléfono
+        $consultanteId = null;
+
+        if ($dni) {
+            $stmt = $pdo->prepare('SELECT id FROM users WHERE dni = ? LIMIT 1');
+            $stmt->execute([$dni]);
+            $existing = $stmt->fetch();
+            if ($existing) {
+                $consultanteId = $existing['id'];
+                // Actualizar datos existentes
+                $stmt = $pdo->prepare('UPDATE users SET name = ?, phone = ?, email = ?, updated_at = NOW() WHERE id = ?');
+                $stmt->execute([$name, $phone, $email, $consultanteId]);
+            }
         }
-    }
 
-    if (!$consultanteId) {
-        // Crear usuario nuevo
+        if (!$consultanteId && $phone) {
+            $stmt = $pdo->prepare('SELECT id FROM users WHERE phone = ? LIMIT 1');
+            $stmt->execute([$phone]);
+            $existing = $stmt->fetch();
+            if ($existing) {
+                $consultanteId = $existing['id'];
+                $stmt = $pdo->prepare('UPDATE users SET name = ?, dni = ?, email = ?, updated_at = NOW() WHERE id = ?');
+                $stmt->execute([$name, $dni, $email, $consultanteId]);
+            }
+        }
+
+        if (!$consultanteId) {
+            // Crear usuario nuevo
+            $stmt = $pdo->prepare(
+                "INSERT INTO users (name, dni, phone, email, role, created_at)
+                 VALUES (?, ?, ?, ?, 'consultante', NOW())"
+            );
+            $stmt->execute([$name, $dni, $phone, $email]);
+            $consultanteId = (int)$pdo->lastInsertId();
+        }
+
+        // Crear caso
         $stmt = $pdo->prepare(
-            "INSERT INTO users (name, phone, email, zone, address, role, created_at)
-             VALUES (?, ?, ?, ?, ?, 'consultante', NOW())"
+            "INSERT INTO cases (consultante_id, description, input_method, status, created_at)
+             VALUES (?, ?, 'texto', 'ingresado', NOW())"
         );
-        $stmt->execute([$name, $phoneClean, $email, $zone, $address]);
-        $consultanteId = (int)$pdo->lastInsertId();
+        $stmt->execute([$consultanteId, $description ?? '']);
+        $caseId = (int)$pdo->lastInsertId();
+
+        // Historial del caso
+        $stmt = $pdo->prepare(
+            "INSERT INTO case_history (case_id, user_id, action, comment, created_at)
+             VALUES (?, ?, 'caso_creado', 'Caso creado via asistente IA (usuario nuevo)', NOW())"
+        );
+        $stmt->execute([$caseId, $consultanteId]);
+
+        $pdo->commit();
+
+        error_log("[{$sessionId}] Usuario nuevo + caso creados - Usuario ID: {$consultanteId}, Caso ID: {$caseId}");
+        return ['userId' => $consultanteId, 'caseId' => $caseId];
+
+    } catch (Exception $e) {
+        $pdo->rollBack();
+        throw $e;
     }
-
-    // Crear caso
-    $stmt = $pdo->prepare(
-        "INSERT INTO cases (consultante_id, problem_type_id, description, input_method, status, created_at)
-         VALUES (?, ?, ?, 'texto', 'ingresado', NOW())"
-    );
-    $stmt->execute([$consultanteId, 1, $description]); // problem_type_id = 1 como default
-    $caseId = (int)$pdo->lastInsertId();
-
-    error_log("[{$sessionId}] Formulario guardado - Usuario ID: {$consultanteId}, Caso ID: {$caseId}");
-
-    return ['success' => true, 'userId' => $consultanteId, 'caseId' => $caseId];
 }

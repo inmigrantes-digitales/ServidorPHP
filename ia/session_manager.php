@@ -5,13 +5,14 @@
  * En PHP no hay estado en memoria entre requests (a diferencia de Node.js).
  * Las sesiones de IA se persisten como archivos JSON temporales.
  *
- * Estructura de sesión:
+ * Estructura de sesión (agente único):
  * {
  *   "history": [ {"role": "user|assistant", "content": "..."} ],
- *   "formData": { "name": "...", ... },
+ *   "userData": { "dni": "...", "nombre": "...", "telefono": "...", "email": "..." },
+ *   "problemData": { "descripcion": "...", "categoria": "..." },
+ *   "dbUser": null | { "id": ..., "name": ..., "phone": ... },
  *   "awaitingConfirmation": false,
- *   "mode": "recepcionista|formulario",
- *   "userData": null | { "id": ..., "name": ..., "dni": ..., "description": ... },
+ *   "lastAction": "ask_dni",
  *   "updated_at": 1234567890
  * }
  */
@@ -66,10 +67,11 @@ function getAISession(string $sessionId): array
     // Sesión por defecto
     return [
         'history'              => [],
-        'formData'             => [],
+        'userData'             => [],
+        'problemData'          => [],
+        'dbUser'               => null,
         'awaitingConfirmation' => false,
-        'mode'                 => 'recepcionista',
-        'userData'             => null,
+        'lastAction'           => null,
         'updated_at'           => time(),
     ];
 }

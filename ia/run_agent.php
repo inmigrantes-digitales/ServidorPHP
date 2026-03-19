@@ -1,36 +1,29 @@
 <?php
 /**
- * Orquestador de agentes de IA.
+ * Orquestador del agente de IA (agente único).
  *
- * Selecciona el prompt adecuado, construye los mensajes para el LLM,
+ * Construye los mensajes para el LLM usando el prompt unificado,
  * llama al modelo, parsea la respuesta JSON, y normaliza el resultado.
  *
- * Replica la lógica de src/ia/runAgent.js del backend Node.js.
+ * Ya no hay múltiples agentes — un solo flujo maneja identificación,
+ * registro y creación de tickets.
  */
 
-// Dependencias (deben estar ya incluidas por index.php o el endpoint que llama)
-// require_once: json_extractor.php, llm_client.php, prompts
-
 /**
- * Ejecuta un agente de IA con los parámetros dados.
+ * Ejecuta el agente de IA con los parámetros dados.
  *
  * @param array $params [
- *   'agentType'      => 'recepcionista' | 'formulario',
  *   'userMessage'    => string,
- *   'userContext'     => array (datos del usuario si existe),
- *   'sessionContext'  => array (formData actual de la sesión),
+ *   'sessionContext'  => array (userData, problemData, dbUser de la sesión),
  *   'history'         => array (historial de mensajes),
  *   'model'           => ['provider' => 'groq'|'gemini', 'name' => '...', 'temperature' => 0.7],
  *   'stream'          => bool,
  *   'onToken'         => callable|null,
  * ]
- * @return array Resultado normalizado:
- *   Si éxito: ['ok' => true, 'assistant_message' => ..., 'data' => ..., 'missing_info' => [...], 'flags' => [...]]
- *   Si error: ['ok' => false, 'error' => ..., 'assistant_message' => ..., 'data' => null]
+ * @return array Resultado normalizado con la nueva estructura JSON.
  */
 function runAgent(array $params): array
 {
-    $agentType      = $params['agentType'];
     $userMessage    = $params['userMessage'];
     $sessionContext = $params['sessionContext'] ?? [];
     $history        = $params['history'] ?? [];
@@ -38,23 +31,10 @@ function runAgent(array $params): array
     $stream         = $params['stream'] ?? false;
     $onToken        = $params['onToken'] ?? null;
 
-    // 1. Obtener prompt del sistema según el tipo de agente
-    $prompts = getPrompts();
-    if (!isset($prompts[$agentType])) {
-        return [
-            'ok'                => false,
-            'error'             => 'INVALID_AGENT',
-            'assistant_message' => "Tipo de agente no soportado: $agentType",
-            'data'              => null,
-        ];
-    }
+    // 1. Construir system prompt con contexto inyectado
+    $systemPrompt = getSystemPrompt($sessionContext);
 
-    // 2. Construir system prompt
-    // Para el formulario, usar la versión con datos actuales (como promptFormularioOld en Node.js)
-    $currentData = $sessionContext['current_data'] ?? $sessionContext;
-    $systemPrompt = getPromptFormularioWithData($currentData);
-
-    // 3. Construir mensajes para el LLM
+    // 2. Construir mensajes para el LLM
     $messages = [
         ['role' => 'system', 'content' => $systemPrompt],
     ];
@@ -68,10 +48,11 @@ function runAgent(array $params): array
         ];
     }
 
-    // Agregar mensaje del usuario
-    $messages[] = ['role' => 'user', 'content' => $userMessage];
+    // Agregar mensaje del usuario con refuerzo de formato JSON
+    $jsonReminder = "\n\nRECORDATORIO: Responde ÚNICAMENTE con un objeto JSON válido. Sin texto adicional, sin markdown, sin explicaciones. Solo el JSON.";
+    $messages[] = ['role' => 'user', 'content' => $userMessage . $jsonReminder];
 
-    // 4. Llamar al LLM
+    // 3. Llamar al LLM
     try {
         $rawResponse = callLLM([
             'messages' => $messages,
@@ -97,38 +78,98 @@ function runAgent(array $params): array
         ];
 
         return [
-            'ok'                => false,
-            'error'             => $errorType,
-            'errorMessage'      => $e->getMessage(),
-            'assistant_message' => $friendlyMessages[$errorType] ?? $friendlyMessages['API_ERROR'],
-            'data'              => null,
-            'retryable'         => in_array($errorType, ['RATE_LIMIT', 'NETWORK_ERROR']),
+            'ok'    => false,
+            'error' => $errorType,
+            'parsed' => buildFallbackResponse($friendlyMessages[$errorType] ?? $friendlyMessages['API_ERROR']),
         ];
     }
 
-    // 5. Parsear JSON de la respuesta
+    // 4. Parsear JSON de la respuesta
     $parsed = extractFirstJSON($rawResponse);
 
+    // Si no se pudo parsear, reintentar UNA vez sin streaming
     if ($parsed === null) {
-        error_log("[runAgent] No se pudo parsear JSON. Respuesta: " . substr($rawResponse, 0, 200));
+        error_log("[runAgent] JSON inválido en primer intento. Respuesta: " . substr($rawResponse, 0, 300));
+
+        try {
+            $retryResponse = callLLM([
+                'messages'   => $messages,
+                'model'      => $model,
+                'stream'     => false,
+                'onToken'    => null,
+                'maxRetries' => 1,
+            ]);
+            $parsed = extractFirstJSON($retryResponse);
+        } catch (RuntimeException $e) {
+            error_log("[runAgent] Reintento también falló: " . $e->getMessage());
+        }
+    }
+
+    if ($parsed === null) {
+        error_log("[runAgent] No se pudo parsear JSON tras reintento. Respuesta original: " . substr($rawResponse, 0, 300));
         return [
-            'ok'                => false,
-            'error'             => 'INVALID_JSON',
-            'assistant_message' => 'Disculpe, no pude entender correctamente la respuesta. Por favor, intente reformular su mensaje.',
-            'data'              => null,
+            'ok'    => false,
+            'error' => 'INVALID_JSON',
+            'parsed' => buildFallbackResponse('Disculpe, no pude procesar su mensaje correctamente. ¿Podría intentar de nuevo?'),
         ];
     }
 
-    // 6. Normalizar y retornar
+    // 5. Normalizar y retornar
     return [
-        'ok'                => true,
-        'assistant_message' => $parsed['assistant_message'] ?? '',
-        'data'              => $parsed['current_data'] ?? [],
-        'missing_info'      => $parsed['missing_info'] ?? [],
-        'flags'             => [
-            'need_confirmation' => !empty($parsed['need_confirmation']),
-            'process_finished'  => !empty($parsed['process_finished']),
-            'user_confirmed'    => !empty($parsed['user_confirmed']),
+        'ok'     => true,
+        'parsed' => normalizeResponse($parsed),
+    ];
+}
+
+/**
+ * Normaliza la respuesta del LLM asegurando que todos los campos existan.
+ */
+function normalizeResponse(array $parsed): array
+{
+    // Asegurar estructura mínima
+    $parsed['schema_version'] = $parsed['schema_version'] ?? '1.0';
+
+    if (empty($parsed['assistant']['message'])) {
+        $parsed['assistant'] = $parsed['assistant'] ?? [];
+        $parsed['assistant']['message'] = $parsed['assistant']['message'] ?? 'Disculpe, no pude procesar su mensaje.';
+        $parsed['assistant']['tone'] = $parsed['assistant']['tone'] ?? 'empatico';
+    }
+
+    $parsed['intent'] = $parsed['intent'] ?? ['primary' => null, 'secondary' => [], 'confidence' => 0.0];
+
+    $parsed['data'] = $parsed['data'] ?? [];
+    $parsed['data']['update'] = $parsed['data']['update'] ?? [
+        'dni' => null, 'nombre' => null, 'telefono' => null,
+        'email' => null, 'descripcion' => null, 'categoria' => null,
+    ];
+    $parsed['data']['summary'] = $parsed['data']['summary'] ?? null;
+
+    $parsed['validation'] = $parsed['validation'] ?? ['missing_fields' => [], 'invalid_fields' => []];
+    $parsed['process'] = $parsed['process'] ?? ['need_confirmation' => false, 'can_continue' => true, 'suggest_finish' => false];
+    $parsed['handoff'] = $parsed['handoff'] ?? ['recommended' => false, 'target' => null, 'reason' => null];
+    $parsed['meta'] = $parsed['meta'] ?? ['agent_type' => 'recepcionista', 'confidence' => 0.0, 'warnings' => []];
+    $parsed['action'] = $parsed['action'] ?? 'ask_dni';
+
+    return $parsed;
+}
+
+/**
+ * Construye una respuesta JSON de fallback para errores.
+ */
+function buildFallbackResponse(string $message): array
+{
+    return [
+        'schema_version' => '1.0',
+        'assistant' => ['message' => $message, 'tone' => 'empatico'],
+        'intent' => ['primary' => null, 'secondary' => [], 'confidence' => 0.0],
+        'data' => [
+            'update' => ['dni' => null, 'nombre' => null, 'telefono' => null, 'email' => null, 'descripcion' => null, 'categoria' => null],
+            'summary' => null,
         ],
+        'validation' => ['missing_fields' => [], 'invalid_fields' => []],
+        'process' => ['need_confirmation' => false, 'can_continue' => true, 'suggest_finish' => false],
+        'handoff' => ['recommended' => false, 'target' => null, 'reason' => null],
+        'meta' => ['agent_type' => 'recepcionista', 'confidence' => 0.0, 'warnings' => []],
+        'action' => 'ask_dni',
     ];
 }

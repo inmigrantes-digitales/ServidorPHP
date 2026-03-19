@@ -47,39 +47,53 @@ function isValidAddress(string $address): bool
 }
 
 /**
- * Valida campos obligatorios del formulario de registro de caso (IA).
+ * Valida campos obligatorios para registro de usuario nuevo.
+ * Usa los nombres de campos del prompt unificado (español).
  *
- * @param array $formData Datos del formulario.
+ * @param array $userData Datos del usuario de la sesión.
  * @return array ['missing' => [...], 'errors' => [...], 'isValid' => bool]
  */
-function validateRequiredFormFields(array $formData): array
+function validateUserFields(array $userData): array
 {
     $missing = [];
     $errors = [];
 
-    if (empty($formData['name']) || !isValidName((string)$formData['name'])) {
-        $missing[] = 'name';
-        $errors['name'] = 'Debe incluir nombre y apellido';
+    if (empty($userData['nombre']) || !isValidName((string)$userData['nombre'])) {
+        $missing[] = 'nombre';
+        $errors['nombre'] = 'Debe incluir nombre y apellido';
     }
 
-    if (empty($formData['dni']) || !isValidDni((string)$formData['dni'])) {
+    if (empty($userData['dni']) || !isValidDni((string)$userData['dni'])) {
         $missing[] = 'dni';
         $errors['dni'] = 'Debe ser un DNI válido (al menos 7 dígitos)';
     }
 
-    if (empty($formData['address']) || !isValidAddress((string)$formData['address'])) {
-        $missing[] = 'address';
-        $errors['address'] = 'Debe incluir calle y número';
+    if (empty($userData['telefono']) || !isValidPhone((string)$userData['telefono'])) {
+        $missing[] = 'telefono';
+        $errors['telefono'] = 'Debe ser un teléfono válido (al menos 8 dígitos)';
     }
 
-    if (empty($formData['description']) || strlen(trim((string)$formData['description'])) < 10) {
-        $missing[] = 'description';
-        $errors['description'] = 'Debe describir el problema (al menos 10 caracteres)';
-    }
+    return [
+        'missing' => $missing,
+        'errors'  => $errors,
+        'isValid' => count($missing) === 0,
+    ];
+}
 
-    if (empty($formData['phone']) || !isValidPhone((string)$formData['phone'])) {
-        $missing[] = 'phone';
-        $errors['phone'] = 'Debe ser un teléfono válido (al menos 8 dígitos)';
+/**
+ * Valida que haya una descripción de problema válida.
+ *
+ * @param array $problemData Datos del problema de la sesión.
+ * @return array ['missing' => [...], 'errors' => [...], 'isValid' => bool]
+ */
+function validateProblemFields(array $problemData): array
+{
+    $missing = [];
+    $errors = [];
+
+    if (empty($problemData['descripcion']) || strlen(trim((string)$problemData['descripcion'])) < 10) {
+        $missing[] = 'descripcion';
+        $errors['descripcion'] = 'Debe describir el problema (al menos 10 caracteres)';
     }
 
     return [
