@@ -88,7 +88,14 @@ function classifyLLMError(int $httpCode, string $errorMsg, string $provider): ar
  * @return string Texto completo generado.
  * @throws RuntimeException En caso de error no recuperable.
  */
-function callGroq(array $messages, string $model, float $temperature = 0.7, bool $stream = false, ?callable $onToken = null): string
+function callGroq(
+    array $messages,
+    string $model,
+    float $temperature = 0.7,
+    bool $stream = false,
+    ?callable $onToken = null,
+    bool $forceJson = false
+): string
 {
     if (empty(GROQ_API_KEY)) {
         throw new RuntimeException('GROQ_API_KEY no configurada');
@@ -101,6 +108,10 @@ function callGroq(array $messages, string $model, float $temperature = 0.7, bool
         'temperature' => $temperature,
         'stream'      => $stream,
     ];
+
+    if ($forceJson) {
+        $payload['response_format'] = ['type' => 'json_object'];
+    }
 
     return callOpenAICompatible($url, GROQ_API_KEY, $payload, $stream, $onToken, 'groq');
 }
@@ -116,7 +127,14 @@ function callGroq(array $messages, string $model, float $temperature = 0.7, bool
  * @return string Texto completo generado.
  * @throws RuntimeException En caso de error no recuperable.
  */
-function callGemini(array $messages, string $model, float $temperature = 0.7, bool $stream = false, ?callable $onToken = null): string
+function callGemini(
+    array $messages,
+    string $model,
+    float $temperature = 0.7,
+    bool $stream = false,
+    ?callable $onToken = null,
+    bool $forceJson = false
+): string
 {
     if (empty(GEMINI_API_KEY)) {
         throw new RuntimeException('GEMINI_API_KEY no configurada');
@@ -138,7 +156,7 @@ function callGemini(array $messages, string $model, float $temperature = 0.7, bo
 
     foreach ($candidates as $index => $candidateModel) {
         try {
-            return callGeminiRequest($messages, $candidateModel, $temperature, $stream, $onToken);
+            return callGeminiRequest($messages, $candidateModel, $temperature, $stream, $onToken, $forceJson);
         } catch (RuntimeException $e) {
             $lastException = $e;
 
@@ -158,7 +176,14 @@ function callGemini(array $messages, string $model, float $temperature = 0.7, bo
 /**
  * Ejecuta una llamada Gemini con un modelo específico.
  */
-function callGeminiRequest(array $messages, string $model, float $temperature = 0.7, bool $stream = false, ?callable $onToken = null): string
+function callGeminiRequest(
+    array $messages,
+    string $model,
+    float $temperature = 0.7,
+    bool $stream = false,
+    ?callable $onToken = null,
+    bool $forceJson = false
+): string
 {
     if (empty(GEMINI_API_KEY)) {
         throw new RuntimeException('GEMINI_API_KEY no configurada');
@@ -168,7 +193,7 @@ function callGeminiRequest(array $messages, string $model, float $temperature = 
     // terminar duplicando texto al parsearlo manualmente. Para estabilidad,
     // pedimos respuesta completa y la reenviamos como un unico chunk SSE.
     if ($stream && $onToken !== null) {
-        $fullText = callGeminiRequest($messages, $model, $temperature, false, null);
+        $fullText = callGeminiRequest($messages, $model, $temperature, false, null, $forceJson);
         if ($fullText !== '') {
             $onToken($fullText);
         }
@@ -205,6 +230,9 @@ function callGeminiRequest(array $messages, string $model, float $temperature = 
         ];
     }
     $payload['generationConfig'] = ['temperature' => $temperature];
+    if ($forceJson) {
+        $payload['generationConfig']['responseMimeType'] = 'application/json';
+    }
 
     $timeout = (defined('LLM_TIMEOUT') && LLM_TIMEOUT > 0) ? LLM_TIMEOUT : 90;
     $connectTimeout = (defined('LLM_CONNECT_TIMEOUT') && LLM_CONNECT_TIMEOUT > 0) ? LLM_CONNECT_TIMEOUT : 20;
@@ -387,6 +415,7 @@ function callLLM(array $params): string
     $model       = $params['model'];
     $stream      = $params['stream'] ?? false;
     $onToken     = $params['onToken'] ?? null;
+    $forceJson   = $params['forceJson'] ?? false;
     $maxRetries  = $params['maxRetries'] ?? (defined('LLM_MAX_RETRIES') ? LLM_MAX_RETRIES : 2);
     $temperature = $model['temperature'] ?? 0.7;
 
@@ -396,9 +425,9 @@ function callLLM(array $params): string
         try {
             switch ($model['provider']) {
                 case 'groq':
-                    return callGroq($messages, $model['name'], $temperature, $stream, $onToken);
+                    return callGroq($messages, $model['name'], $temperature, $stream, $onToken, $forceJson);
                 case 'gemini':
-                    return callGemini($messages, $model['name'], $temperature, $stream, $onToken);
+                    return callGemini($messages, $model['name'], $temperature, $stream, $onToken, $forceJson);
                 default:
                     throw new RuntimeException("Proveedor IA no soportado: {$model['provider']}");
             }

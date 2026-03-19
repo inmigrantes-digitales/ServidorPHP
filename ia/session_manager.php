@@ -11,6 +11,7 @@
  *   "userData": { "dni": "...", "nombre": "...", "telefono": "...", "email": "..." },
  *   "problemData": { "descripcion": "...", "categoria": "..." },
  *   "dbUser": null | { "id": ..., "name": ..., "phone": ... },
+ *   "userLookupDone": false,
  *   "awaitingConfirmation": false,
  *   "lastAction": "ask_dni",
  *   "updated_at": 1234567890
@@ -60,6 +61,13 @@ function getAISession(string $sessionId): array
         $content = file_get_contents($path);
         $data = json_decode($content, true);
         if (is_array($data)) {
+            // Backfill de campos para sesiones antiguas
+            if (!array_key_exists('userData', $data) || !is_array($data['userData'])) $data['userData'] = [];
+            if (!array_key_exists('problemData', $data) || !is_array($data['problemData'])) $data['problemData'] = [];
+            if (!array_key_exists('dbUser', $data)) $data['dbUser'] = null;
+            if (!array_key_exists('userLookupDone', $data)) $data['userLookupDone'] = false;
+            if (!array_key_exists('awaitingConfirmation', $data)) $data['awaitingConfirmation'] = false;
+            if (!array_key_exists('lastAction', $data)) $data['lastAction'] = null;
             return $data;
         }
     }
@@ -70,6 +78,7 @@ function getAISession(string $sessionId): array
         'userData'             => [],
         'problemData'          => [],
         'dbUser'               => null,
+        'userLookupDone'       => false,
         'awaitingConfirmation' => false,
         'lastAction'           => null,
         'updated_at'           => time(),

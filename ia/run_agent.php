@@ -59,6 +59,7 @@ function runAgent(array $params): array
             'model'    => $model,
             'stream'   => $stream,
             'onToken'  => $onToken,
+            'forceJson' => true,
         ]);
     } catch (RuntimeException $e) {
         $errorType = 'API_ERROR';
@@ -98,6 +99,7 @@ function runAgent(array $params): array
                 'stream'     => false,
                 'onToken'    => null,
                 'maxRetries' => 1,
+                'forceJson'  => true,
             ]);
             $parsed = extractFirstJSON($retryResponse);
         } catch (RuntimeException $e) {
@@ -107,10 +109,11 @@ function runAgent(array $params): array
 
     if ($parsed === null) {
         error_log("[runAgent] No se pudo parsear JSON tras reintento. Respuesta original: " . substr($rawResponse, 0, 300));
+        $fallback = buildPlainTextFallback($rawResponse, $sessionContext, $userMessage);
         return [
             'ok'    => false,
             'error' => 'INVALID_JSON',
-            'parsed' => buildFallbackResponse('Disculpe, no pude procesar su mensaje correctamente. ¿Podría intentar de nuevo?'),
+            'parsed' => $fallback,
         ];
     }
 
@@ -172,4 +175,108 @@ function buildFallbackResponse(string $message): array
         'meta' => ['agent_type' => 'recepcionista', 'confidence' => 0.0, 'warnings' => []],
         'action' => 'ask_dni',
     ];
+}
+
+/**
+ * Convierte una respuesta de texto plano en un JSON válido utilizable.
+ */
+function buildPlainTextFallback(string $rawText, array $sessionContext, string $userMessage = ''): array
+{
+    $message = trim($rawText);
+    if ($message === '') {
+        $message = 'Disculpe, no pude procesar su mensaje correctamente. ¿Podría intentar de nuevo?';
+    }
+
+    $userData = $sessionContext['userData'] ?? [];
+    $problemData = $sessionContext['problemData'] ?? [];
+    $dbUser = $sessionContext['dbUser'] ?? null;
+    $lookupDone = !empty($sessionContext['userLookupDone']);
+
+    // Extraer datos básicos del mensaje del usuario para no perder memoria
+    $msg = trim($userMessage);
+    if ($msg !== '') {
+        if (empty($userData['dni']) && preg_match('/\b(\d{7,8})\b/', $msg, $m)) {
+            $userData['dni'] = $m[1];
+        }
+
+        if (empty($userData['telefono']) && preg_match('/\b(\d{8,15})\b/', preg_replace('/\D/', ' ', $msg), $m)) {
+            $digits = preg_replace('/\D/', '', $m[1]);
+            if (strlen($digits) >= 8 && strlen($digits) !== 7 && strlen($digits) !== 8) {
+                $userData['telefono'] = $digits;
+            }
+        }
+
+        if (empty($userData['nombre'])) {
+            $clean = trim(preg_replace('/\s+/', ' ', preg_replace('/[^\p{L}\s]/u', ' ', $msg)));
+            if (preg_match('/\bmi nombre es\s+([\p{L}]+\s+[\p{L}]+)\b/ui', $clean, $m)) {
+                $userData['nombre'] = trim($m[1]);
+            } elseif (preg_match('/^[\p{L}]+\s+[\p{L}]+$/u', $clean)) {
+                $userData['nombre'] = $clean;
+            }
+        }
+
+        if (empty($problemData['descripcion']) && mb_strlen($msg) >= 20 && !preg_match('/\b(\d{7,15})\b/', $msg)) {
+            $problemData['descripcion'] = $msg;
+        }
+    }
+
+    $action = 'ask_dni';
+    $missing = [];
+    $msgLower = mb_strtolower($msg, 'UTF-8');
+    $wantsCaseStatus = $msg !== '' && (
+        str_contains($msgLower, 'estado')
+        || str_contains($msgLower, 'seguimiento')
+        || str_contains($msgLower, 'como va')
+        || str_contains($msgLower, 'cómo va')
+        || str_contains($msgLower, 'mi caso')
+        || preg_match('/\bcaso\s*(?:n(?:u|ú)mero|nro|n|#)?\s*\d+\b/ui', $msg) === 1
+    );
+
+    if ($wantsCaseStatus) {
+        if (empty($userData['dni']) && empty($dbUser)) {
+            $action = 'ask_dni';
+            $missing[] = 'dni';
+        } else {
+            $action = 'check_case_status';
+        }
+    }
+
+    if (!$wantsCaseStatus && !empty($dbUser)) {
+        if (!empty($problemData['descripcion'])) {
+            $action = 'confirm_data';
+        } else {
+            $action = 'ask_problem';
+            $missing[] = 'descripcion';
+        }
+    } elseif (!$wantsCaseStatus) {
+        if (empty($userData['dni'])) {
+            $action = 'ask_dni';
+            $missing[] = 'dni';
+        } elseif (!$lookupDone) {
+            $action = 'check_user';
+        } elseif (empty($userData['nombre']) || empty($userData['telefono'])) {
+            $action = 'register_user';
+            if (empty($userData['nombre'])) $missing[] = 'nombre';
+            if (empty($userData['telefono'])) $missing[] = 'telefono';
+        } elseif (empty($problemData['descripcion'])) {
+            $action = 'ask_problem';
+            $missing[] = 'descripcion';
+        } else {
+            $action = 'confirm_data';
+        }
+    }
+
+    $json = buildFallbackResponse($message);
+    $json['action'] = $action;
+    $json['validation']['missing_fields'] = $missing;
+    $json['data']['update'] = [
+        'dni' => $userData['dni'] ?? null,
+        'nombre' => $userData['nombre'] ?? null,
+        'telefono' => $userData['telefono'] ?? null,
+        'email' => $userData['email'] ?? null,
+        'descripcion' => $problemData['descripcion'] ?? null,
+        'categoria' => $problemData['categoria'] ?? null,
+    ];
+
+    return $json;
 }

@@ -86,6 +86,8 @@ try {
         'userData'    => $session['userData'] ?? [],
         'problemData' => $session['problemData'] ?? [],
         'dbUser'      => $session['dbUser'] ?? null,
+        'userLookupDone' => !empty($session['userLookupDone']),
+        'problemTypes' => getProblemTypesForPrompt(),
     ];
 
     // ── Llamar al LLM con streaming ──
@@ -115,7 +117,9 @@ try {
 
     // ── Dispatch de acciones de BD ──
     $action = $parsed['action'] ?? 'ask_dni';
-    $parsed = handleAction($action, $parsed, $session, $sessionId);
+    $action = reconcileActionWithSession($action, $session, $parsed);
+    $parsed['action'] = $action;
+    $parsed = handleAction($action, $parsed, $session, $sessionId, $message);
 
     // ── Guardar estado ──
     $session['lastAction'] = $action;
@@ -139,11 +143,14 @@ exit;
 /**
  * Ejecuta la acción indicada por el LLM contra la base de datos.
  */
-function handleAction(string $action, array $parsed, array &$session, string $sessionId): array
+function handleAction(string $action, array $parsed, array &$session, string $sessionId, string $userMessage): array
 {
     switch ($action) {
         case 'check_user':
             return handleCheckUser($parsed, $session);
+
+        case 'check_case_status':
+            return handleCaseStatus($parsed, $session, $userMessage);
 
         case 'register_user':
         case 'update_user_data':
@@ -171,6 +178,68 @@ function handleAction(string $action, array $parsed, array &$session, string $se
 }
 
 /**
+ * Consulta el estado del caso (por ID explícito o el más reciente del usuario).
+ */
+function handleCaseStatus(array $parsed, array &$session, string $userMessage): array
+{
+    $dbUser = $session['dbUser'] ?? null;
+    $dni = $session['userData']['dni'] ?? null;
+
+    // Si aún no tenemos usuario en sesión, intentar resolver por DNI ya capturado
+    if (empty($dbUser) && !empty($dni)) {
+        $dbUser = findUserByDni(preg_replace('/\D/', '', $dni));
+        $session['dbUser'] = $dbUser ?: null;
+        $session['userLookupDone'] = true;
+    }
+
+    if (empty($dbUser) || empty($dbUser['id'])) {
+        $parsed['assistant']['message'] = 'Para consultar el estado de su caso necesito su DNI. ¿Podría indicármelo, por favor?';
+        $parsed['action'] = 'ask_dni';
+        $parsed['validation']['missing_fields'] = ['dni'];
+        return $parsed;
+    }
+
+    $requestedCaseId = extractRequestedCaseId($userMessage);
+    $case = findCaseForConsultante((int)$dbUser['id'], $requestedCaseId);
+
+    if (!$case) {
+        if ($requestedCaseId !== null) {
+            $parsed['assistant']['message'] = "No encontré el caso N° {$requestedCaseId} asociado a su cuenta. Si desea, puedo informarle el estado de su caso más reciente.";
+        } else {
+            $parsed['assistant']['message'] = 'No encontré casos cargados para su cuenta todavía. Si lo desea, puedo ayudarle a crear una nueva consulta ahora mismo.';
+        }
+        $parsed['action'] = 'ask_problem';
+        return $parsed;
+    }
+
+    $statusText = mapCaseStatusToHumanText((string)$case['status']);
+    $facilitator = $case['facilitator_name'] ?? null;
+    $problemType = $case['problem_type_name'] ?? 'Sin categoría';
+
+    $msg = "El estado de su caso N° {$case['id']} es: {$statusText}.";
+    if (!empty($facilitator)) {
+        $msg .= " Está siendo atendido por {$facilitator}.";
+    } elseif (($case['status'] ?? '') === 'ingresado') {
+        $msg .= ' Aún no fue tomado por un facilitador, pero está en la cola de atención.';
+    }
+
+    $msg .= " Tipo de problema: {$problemType}.";
+    $msg .= ' Si desea, también puedo ayudarle con una nueva consulta.';
+
+    $parsed['assistant']['message'] = $msg;
+    $parsed['action'] = 'check_case_status';
+    $parsed['data']['summary'] = [
+        'case_id' => (int)$case['id'],
+        'status' => $case['status'],
+        'facilitator' => $facilitator,
+        'problem_type' => $problemType,
+        'created_at' => $case['created_at'] ?? null,
+    ];
+
+    return $parsed;
+}
+
+/**
  * Busca un usuario por DNI en la base de datos.
  */
 function handleCheckUser(array $parsed, array &$session): array
@@ -193,6 +262,7 @@ function handleCheckUser(array $parsed, array &$session): array
 
     // Guardar DNI limpio en sesión
     $session['userData']['dni'] = $dniClean;
+    $session['userLookupDone'] = true;
 
     // Buscar en BD
     $dbUser = findUserByDni($dniClean);
@@ -216,6 +286,126 @@ function handleCheckUser(array $parsed, array &$session): array
 }
 
 /**
+ * Evita retrocesos del flujo si el LLM pierde contexto.
+ */
+function reconcileActionWithSession(string $action, array $session, array $parsed): string
+{
+    $userData = $session['userData'] ?? [];
+    $problemData = $session['problemData'] ?? [];
+    $dbUser = $session['dbUser'] ?? null;
+    $lookupDone = !empty($session['userLookupDone']);
+
+    $hasDni = !empty($userData['dni']);
+    $hasNombre = !empty($userData['nombre']);
+    $hasTelefono = !empty($userData['telefono']);
+    $hasDescripcion = !empty($problemData['descripcion']);
+
+    if ($action === 'check_case_status') {
+        return $action;
+    }
+
+    // Si ya se verificó DNI y no se encontró usuario, NO volver a pedir DNI.
+    if ($lookupDone && empty($dbUser)) {
+        if (!$hasNombre || !$hasTelefono) {
+            return 'register_user';
+        }
+        if (!$hasDescripcion) {
+            return 'ask_problem';
+        }
+        if ($action === 'ask_dni' || $action === 'check_user') {
+            return 'confirm_data';
+        }
+    }
+
+    // Si ya hay usuario encontrado, no tiene sentido pedir registro ni DNI.
+    if (!empty($dbUser)) {
+        if (!$hasDescripcion) {
+            return 'ask_problem';
+        }
+        if (in_array($action, ['ask_dni', 'check_user', 'register_user', 'update_user_data'], true)) {
+            return 'confirm_data';
+        }
+    }
+
+    // Si tenemos DNI pero nunca se verificó, forzar check_user en vez de volver a pedir DNI.
+    if ($hasDni && !$lookupDone && $action === 'ask_dni') {
+        return 'check_user';
+    }
+
+    return $action;
+}
+
+/**
+ * Extrae un numero de caso mencionado por el usuario.
+ */
+function extractRequestedCaseId(string $userMessage): ?int
+{
+    if (preg_match('/\bcaso\s*(?:n(?:u|ú)mero|nro|n|#)?\s*(\d+)\b/ui', $userMessage, $m)) {
+        return (int)$m[1];
+    }
+    if (preg_match('/\b#\s*(\d+)\b/u', $userMessage, $m)) {
+        return (int)$m[1];
+    }
+    return null;
+}
+
+/**
+ * Busca un caso del consultante. Si se indica ID, valida pertenencia.
+ */
+function findCaseForConsultante(int $consultanteId, ?int $caseId = null): ?array
+{
+    $pdo = getDB();
+
+    if ($caseId !== null) {
+        $stmt = $pdo->prepare(
+            'SELECT c.id, c.status, c.created_at, c.description, c.problem_type_id,
+                    pt.name AS problem_type_name,
+                    fac.name AS facilitator_name
+             FROM cases c
+             LEFT JOIN problem_types pt ON pt.id = c.problem_type_id
+             LEFT JOIN users fac ON fac.id = c.facilitator_id
+             WHERE c.id = ? AND c.consultante_id = ?
+             LIMIT 1'
+        );
+        $stmt->execute([$caseId, $consultanteId]);
+        $row = $stmt->fetch();
+        return $row ?: null;
+    }
+
+    $stmt = $pdo->prepare(
+        'SELECT c.id, c.status, c.created_at, c.description, c.problem_type_id,
+                pt.name AS problem_type_name,
+                fac.name AS facilitator_name
+         FROM cases c
+         LEFT JOIN problem_types pt ON pt.id = c.problem_type_id
+         LEFT JOIN users fac ON fac.id = c.facilitator_id
+         WHERE c.consultante_id = ?
+         ORDER BY c.created_at DESC
+         LIMIT 1'
+    );
+    $stmt->execute([$consultanteId]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+/**
+ * Traduce estado técnico del caso a texto más claro para el usuario.
+ */
+function mapCaseStatusToHumanText(string $status): string
+{
+    $map = [
+        'ingresado' => 'Ingresado (pendiente de asignación)',
+        'asignado' => 'Asignado a un facilitador',
+        'proceso' => 'En proceso de resolución',
+        'resuelto' => 'Resuelto',
+        'cerrado' => 'Cerrado',
+        'escalado' => 'Escalado para atención especializada',
+    ];
+
+    return $map[$status] ?? ucfirst($status);
+}
+
+/**
  * Crea el ticket/caso en la base de datos.
  */
 function handleCreateTicket(array $parsed, array &$session, string $sessionId): array
@@ -224,15 +414,17 @@ function handleCreateTicket(array $parsed, array &$session, string $sessionId): 
     $userData    = $session['userData'] ?? [];
     $problemData = $session['problemData'] ?? [];
     $descripcion = $problemData['descripcion'] ?? $parsed['data']['update']['descripcion'] ?? null;
+    $categoria   = $problemData['categoria'] ?? $parsed['data']['update']['categoria'] ?? null;
+    $problemTypeId = resolveProblemTypeId($categoria, $descripcion);
 
     try {
         if ($dbUser && !empty($dbUser['id'])) {
             // Usuario existente → solo crear caso
-            $caseId = saveExistingUserCase((int)$dbUser['id'], $descripcion, $sessionId);
+            $caseId = saveExistingUserCase((int)$dbUser['id'], $descripcion, $problemTypeId, $sessionId);
             $nombre = $dbUser['name'] ?? 'estimado/a';
         } else {
             // Usuario nuevo → crear usuario + caso
-            $result = saveNewUserAndCase($userData, $descripcion, $sessionId);
+            $result = saveNewUserAndCase($userData, $descripcion, $problemTypeId, $sessionId);
             $caseId = $result['caseId'];
             $session['dbUser'] = ['id' => $result['userId']];
             $nombre = $userData['nombre'] ?? 'estimado/a';
@@ -259,18 +451,19 @@ function handleCreateTicket(array $parsed, array &$session, string $sessionId): 
  */
 function executeConfirmedAction(array &$session, string $sessionId): array
 {
-    $lastAction = $session['lastAction'] ?? 'confirm_data';
     $userData    = $session['userData'] ?? [];
     $problemData = $session['problemData'] ?? [];
     $descripcion = $problemData['descripcion'] ?? '';
+    $categoria   = $problemData['categoria'] ?? null;
+    $problemTypeId = resolveProblemTypeId($categoria, $descripcion);
     $dbUser      = $session['dbUser'] ?? null;
 
     try {
         if ($dbUser && !empty($dbUser['id'])) {
-            $caseId = saveExistingUserCase((int)$dbUser['id'], $descripcion, $sessionId);
+            $caseId = saveExistingUserCase((int)$dbUser['id'], $descripcion, $problemTypeId, $sessionId);
             $nombre = $dbUser['name'] ?? $userData['nombre'] ?? 'estimado/a';
         } else {
-            $result = saveNewUserAndCase($userData, $descripcion, $sessionId);
+            $result = saveNewUserAndCase($userData, $descripcion, $problemTypeId, $sessionId);
             $caseId = $result['caseId'];
             $session['dbUser'] = ['id' => $result['userId']];
             $nombre = $userData['nombre'] ?? 'estimado/a';
@@ -360,14 +553,14 @@ function findUserByDni(string $dniClean): ?array
 /**
  * Crea un caso para un usuario existente.
  */
-function saveExistingUserCase(int $userId, ?string $description, string $sessionId): int
+function saveExistingUserCase(int $userId, ?string $description, ?int $problemTypeId, string $sessionId): int
 {
     $pdo = getDB();
     $stmt = $pdo->prepare(
-        "INSERT INTO cases (consultante_id, description, input_method, status, created_at)
-         VALUES (?, ?, 'texto', 'ingresado', NOW())"
+        "INSERT INTO cases (consultante_id, problem_type_id, description, input_method, status, created_at)
+         VALUES (?, ?, ?, 'texto', 'ingresado', NOW())"
     );
-    $stmt->execute([$userId, $description ?? '']);
+    $stmt->execute([$userId, $problemTypeId, $description ?? '']);
     $caseId = (int)$pdo->lastInsertId();
 
     // Registrar en historial de caso
@@ -385,7 +578,7 @@ function saveExistingUserCase(int $userId, ?string $description, string $session
  * Crea un usuario nuevo + caso en una transacción.
  * Mapea campos del prompt (español) a columnas de BD (inglés).
  */
-function saveNewUserAndCase(array $userData, ?string $description, string $sessionId): array
+function saveNewUserAndCase(array $userData, ?string $description, ?int $problemTypeId, string $sessionId): array
 {
     $pdo = getDB();
 
@@ -436,10 +629,10 @@ function saveNewUserAndCase(array $userData, ?string $description, string $sessi
 
         // Crear caso
         $stmt = $pdo->prepare(
-            "INSERT INTO cases (consultante_id, description, input_method, status, created_at)
-             VALUES (?, ?, 'texto', 'ingresado', NOW())"
+              "INSERT INTO cases (consultante_id, problem_type_id, description, input_method, status, created_at)
+               VALUES (?, ?, ?, 'texto', 'ingresado', NOW())"
         );
-        $stmt->execute([$consultanteId, $description ?? '']);
+           $stmt->execute([$consultanteId, $problemTypeId, $description ?? '']);
         $caseId = (int)$pdo->lastInsertId();
 
         // Historial del caso
@@ -458,4 +651,88 @@ function saveNewUserAndCase(array $userData, ?string $description, string $sessi
         $pdo->rollBack();
         throw $e;
     }
+}
+
+/**
+ * Devuelve los tipos de problema para que el prompt pueda categorizar.
+ */
+function getProblemTypesForPrompt(): array
+{
+    static $cache = null;
+    if ($cache !== null) {
+        return $cache;
+    }
+
+    $pdo = getDB();
+    $stmt = $pdo->query('SELECT id, name, description FROM problem_types ORDER BY id ASC');
+    $rows = $stmt->fetchAll() ?: [];
+
+    $cache = array_map(function (array $row): array {
+        return [
+            'id' => (int)$row['id'],
+            'name' => (string)$row['name'],
+            'description' => (string)($row['description'] ?? ''),
+        ];
+    }, $rows);
+
+    return $cache;
+}
+
+/**
+ * Resuelve el ID de tipo de problema a partir de la categoría inferida o descripción.
+ */
+function resolveProblemTypeId(?string $categoria, ?string $descripcion): ?int
+{
+    $types = getProblemTypesForPrompt();
+    if (empty($types)) {
+        return null;
+    }
+
+    $normalize = static function (?string $value): string {
+        $value = trim((string)$value);
+        if ($value === '') {
+            return '';
+        }
+        $value = mb_strtolower($value, 'UTF-8');
+        $value = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value) ?: $value;
+        $value = preg_replace('/[^a-z0-9\s]/', ' ', $value);
+        $value = preg_replace('/\s+/', ' ', $value);
+        return trim($value);
+    };
+
+    $cat = $normalize($categoria);
+    $desc = $normalize($descripcion);
+
+    // 1) Match directo por categoria contra name/description
+    if ($cat !== '') {
+        foreach ($types as $type) {
+            $nameNorm = $normalize($type['name']);
+            $descNorm = $normalize($type['description']);
+            if ($cat === $nameNorm || ($nameNorm !== '' && str_contains($cat, $nameNorm)) || ($cat !== '' && str_contains($nameNorm, $cat))) {
+                return (int)$type['id'];
+            }
+            if ($descNorm !== '' && str_contains($descNorm, $cat)) {
+                return (int)$type['id'];
+            }
+        }
+    }
+
+    // 2) Match por palabras de la descripcion contra el nombre del tipo
+    if ($desc !== '') {
+        foreach ($types as $type) {
+            $nameNorm = $normalize($type['name']);
+            if ($nameNorm !== '' && str_contains($desc, $nameNorm)) {
+                return (int)$type['id'];
+            }
+        }
+    }
+
+    // 3) Fallback a "Otro" si existe
+    foreach ($types as $type) {
+        if ($normalize($type['name']) === 'otro') {
+            return (int)$type['id'];
+        }
+    }
+
+    return (int)$types[0]['id'];
 }

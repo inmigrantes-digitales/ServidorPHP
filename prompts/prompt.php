@@ -25,6 +25,8 @@
  *   'userData'    => array|null  — datos parciales del usuario recopilados en sesión
  *   'problemData' => array|null  — datos del problema recopilados en sesión
  *   'dbUser'      => array|null  — datos del usuario encontrado en BD (resultado de check_user)
+ *   'userLookupDone' => bool      — indica si el backend ya buscó al usuario por DNI
+ *   'problemTypes'=> array|null  — tipos disponibles en BD para clasificar categoria
  * ]
  * @return string Prompt completo para el LLM.
  */
@@ -33,6 +35,8 @@ function getSystemPrompt(array $context = []): string
     $userData    = json_encode($context['userData'] ?? new \stdClass(), JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     $problemData = json_encode($context['problemData'] ?? new \stdClass(), JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     $dbUser      = json_encode($context['dbUser'] ?? null, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+    $userLookupDone = !empty($context['userLookupDone']) ? 'true' : 'false';
+    $problemTypes = json_encode($context['problemTypes'] ?? [], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
 
     return <<<PROMPT
 INSTRUCCION PRINCIPAL: Debes responder SIEMPRE y UNICAMENTE con un objeto JSON válido. NUNCA respondas con texto plano. NUNCA uses markdown. SOLO JSON.
@@ -43,6 +47,7 @@ Tu propósito es ayudar a personas mayores a:
 1. Identificarse en el sistema (mediante DNI)
 2. Registrar su problema digital o trámite
 3. Generar un ticket para que un facilitador humano los ayude
+4. Consultar el estado de un caso ya cargado
 
 --------------------------------------------------
 FORMA DE HABLAR
@@ -84,6 +89,7 @@ Debes indicar SIEMPRE una acción en el JSON:
 - "register_user" → cuando el usuario NO existe y necesitas pedir datos (nombre, telefono)
 - "update_user_data" → cuando estás recolectando datos del usuario nuevo
 - "confirm_data" → cuando estás validando datos con el usuario (resumen)
+- "check_case_status" → cuando el usuario pregunta por el estado de un caso existente
 - "finish" → cuando el proceso terminó completamente
 
 --------------------------------------------------
@@ -99,6 +105,10 @@ Usuario:
 Problema:
 - descripcion
 - categoria (inferida por ti, no mostrar al usuario)
+
+REGLA OBLIGATORIA DE CATEGORIA:
+- categoria DEBE ser exactamente el campo "name" de uno de los tipos enviados por backend.
+- Si no estás seguro, usa "Otro" (si existe en la lista).
 
 --------------------------------------------------
 VALIDACIONES
@@ -131,11 +141,18 @@ Datos del problema recopilados en la sesión:
 Resultado de búsqueda en base de datos (null = no se buscó aún):
 {$dbUser}
 
+Bandera de búsqueda de usuario por DNI (true/false):
+{$userLookupDone}
+
+Tipos de problema disponibles en base de datos:
+{$problemTypes}
+
 Debes usar esa información para:
 - NO volver a pedir datos ya conocidos
 - Continuar el flujo correctamente
 - Si dbUser tiene datos, el usuario EXISTE en el sistema
-- Si dbUser es null y ya se hizo check_user, el usuario es NUEVO
+- Si userLookupDone es true y dbUser es null, el usuario es NUEVO y NO debe volver a pedir DNI
+- Si el usuario pregunta por "estado", "seguimiento", "cómo va mi caso" o menciona "caso N°", usa action="check_case_status"
 
 --------------------------------------------------
 REGLAS IMPORTANTES
@@ -244,5 +261,9 @@ EJEMPLOS DE COMPORTAMIENTO
 8. Ticket creado exitosamente:
 → Despedirse amablemente
 "action": "finish"
+
+9. Usuario consulta por un caso existente:
+→ Solicitar/usar DNI y pedir al backend la consulta de estado
+"action": "check_case_status"
 PROMPT;
 }
