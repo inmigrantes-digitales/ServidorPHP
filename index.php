@@ -95,6 +95,11 @@ $routes = [
 
     // ── Asistente IA ──
     ['GET',  '#^/api/asistente/stream$#',        'api/asistente/stream.php'],
+    ['GET',  '#^/api/asistente/soporte$#',        'api/asistente/soporte.php'],
+    ['GET',  '#^/api/asistente/nuevoUsuario$#',   'api/asistente/nuevo_usuario.php'],
+
+    // ── Proxy ──
+    ['POST', '#^/api/proxy$#', 'api/proxy.php'],
 ];
 
 // ─── Buscar ruta coincidente ─────────────────────────────────
