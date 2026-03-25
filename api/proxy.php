@@ -1,24 +1,16 @@
 <?php
 /**
- * Endpoint Proxy — Hace consultas a otros servidores con autenticación.
+ * Endpoint Proxy — Hace consultas autenticadas a otros servidores.
  *
- * Uso: POST /api/proxy
- * Body: {
- *   "url": "https://otro-servicio.com/endpoint",
- *   "method": "GET|POST|PUT|DELETE",
- *   "headers": {...},  // opcional
- *   "body": {...}      // opcional para POST/PUT
- * }
+ * POST /api/proxy
+ * Body JSON: { "url", "method", "headers"?, "body"? }
  *
- * El proxy:
- * - Agrega HTTP Basic Auth (usuario:clave) si está configurado
- * - Preserva el token JWT del usuario ( Authorization: Bearer ...)
- * - Propaga credenciales internas de forma segura
+ * En hosting con Basic Auth (Ferozo/Donweb):
+ *   - Authorization: Basic ...  → credenciales del hosting (Apache)
+ *   - X-Authorization: Bearer <jwt>  → token del usuario (llega a PHP)
  */
 
-// ─── Validar request ────────────────────────────────────────
-// Nota: En hosting con Basic Auth activo (Ferozo/Donweb), Apache consume el header
-// Authorization. El JWT del usuario llega en X-Authorization.
+// ─── Validar request ──────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
     echo json_encode([
@@ -76,15 +68,10 @@ if (!empty($proxyUser) && !empty($proxyPass)) {
     $curlHeaders[] = 'Authorization: Basic ' . base64_encode("$proxyUser:$proxyPass");
 }
 
-// 2. Preservar token JWT del usuario actual (para identificación)
-// Leer desde X-Authorization (hosting con Basic Auth) o Authorization (sin Basic Auth)
-$xAuth = $_SERVER['HTTP_X_AUTHORIZATION'] ?? '';
-$stdAuth = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
-$jwtSource = !empty($xAuth) ? $xAuth : $stdAuth;
+// 2. Preservar token JWT del usuario (X-Authorization tiene prioridad sobre Authorization)
+$jwtSource = $_SERVER['HTTP_X_AUTHORIZATION'] ?? $_SERVER['HTTP_AUTHORIZATION'] ?? '';
 if (!empty($jwtSource) && preg_match('#Bearer\s+(.+)$#i', $jwtSource, $matches)) {
     $userToken = $matches[1];
-    $curlHeaders[] = 'X-User-Token: ' . $userToken;
-    // También propagar como X-Authorization para que el backend destino pueda autenticar
     $curlHeaders[] = 'X-Authorization: Bearer ' . $userToken;
 }
 

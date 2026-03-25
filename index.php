@@ -125,7 +125,7 @@ foreach ($routes as [$routeMethod, $pattern, $file]) {
             echo json_encode([
                 'ok'      => true,
                 'service' => 'Acceso Senior Backend (PHP)',
-                'version' => '2.1.0',
+                'version' => '2.1.1',
             ]);
             exit;
         }
