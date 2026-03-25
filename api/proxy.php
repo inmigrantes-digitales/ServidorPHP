@@ -17,6 +17,8 @@
  */
 
 // ─── Validar request ────────────────────────────────────────
+// Nota: En hosting con Basic Auth activo (Ferozo/Donweb), Apache consume el header
+// Authorization. El JWT del usuario llega en X-Authorization.
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
     echo json_encode([
@@ -75,12 +77,15 @@ if (!empty($proxyUser) && !empty($proxyPass)) {
 }
 
 // 2. Preservar token JWT del usuario actual (para identificación)
-$authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
-if (!empty($authHeader) && preg_match('#Bearer\s+(.+)$#i', $authHeader, $matches)) {
+// Leer desde X-Authorization (hosting con Basic Auth) o Authorization (sin Basic Auth)
+$xAuth = $_SERVER['HTTP_X_AUTHORIZATION'] ?? '';
+$stdAuth = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+$jwtSource = !empty($xAuth) ? $xAuth : $stdAuth;
+if (!empty($jwtSource) && preg_match('#Bearer\s+(.+)$#i', $jwtSource, $matches)) {
     $userToken = $matches[1];
-    // Agregar token en header custom para que el servidor destino pueda verificar
-    // quién hizo la solicitud
     $curlHeaders[] = 'X-User-Token: ' . $userToken;
+    // También propagar como X-Authorization para que el backend destino pueda autenticar
+    $curlHeaders[] = 'X-Authorization: Bearer ' . $userToken;
 }
 
 // 3. Agregar headers del cliente (custom, sin riesgos de seguridad)
