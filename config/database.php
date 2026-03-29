@@ -95,6 +95,7 @@ define('LLM_MAX_RETRIES', (int) envValue('LLM_MAX_RETRIES', '2'));
 
 // ── CORS ──
 define('CORS_ORIGIN', envValue('CORS_ORIGIN', '*')); // En producción: 'https://tudominio.com'
+define('CORS_ALLOW_CREDENTIALS', envValue('CORS_ALLOW_CREDENTIALS', 'false'));
 
 /**
  * Obtiene una conexión PDO a la base de datos.

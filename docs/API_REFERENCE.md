@@ -49,7 +49,9 @@
 
 Se utiliza **JWT (HMAC-SHA256)** generado manualmente (sin librerías externas).
 
-- Enviar el token en la cabecera: `Authorization: Bearer <token>`
+- Enviar el token en cabecera:
+  - `Authorization: Bearer <token>` (entornos sin Basic Auth)
+  - `X-Authorization: Bearer <token>` (recomendado cuando el hosting usa Basic Auth)
 - Payload: `{ id, role, email, iat, exp }`
 - Expiración por defecto: 7 días
 - Los hashes bcrypt de Node.js son **compatibles** con `password_verify()` de PHP
