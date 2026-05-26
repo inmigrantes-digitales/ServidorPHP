@@ -111,12 +111,29 @@ try {
 
     $parsed = $result['parsed'];
 
+    // Fallback defensivo: si el modelo no colocó DNI en data.update pero el usuario lo escribió,
+    // extraerlo del mensaje para no perder el disparo de check_user.
+    // Aceptamos 7-10 dígitos para capturar entradas mal formateadas y validarlas luego.
+    if (empty($parsed['data']['update']['dni']) && preg_match('/\b(\d{7,10})\b/', $message, $dniMatch)) {
+        $parsed['data']['update']['dni'] = $dniMatch[1];
+    }
+
     // ── Actualizar datos de sesión con lo que extrajo el LLM ──
     $update = $parsed['data']['update'] ?? [];
     mergeSessionData($session, $update);
 
     // ── Dispatch de acciones de BD ──
     $action = $parsed['action'] ?? 'ask_dni';
+
+    // Ajuste de intención por heurística backend para evitar desvíos del modelo:
+    // distinguir entre consulta de estado y carga de nuevo caso.
+    $detectedIntent = detectConversationIntent($message);
+    if ($detectedIntent === 'check_case_status') {
+        $action = 'check_case_status';
+    } elseif ($detectedIntent === 'create_ticket_flow' && $action === 'check_case_status') {
+        $action = chooseCreateFlowAction($session);
+    }
+
     $action = reconcileActionWithSession($action, $session, $parsed);
     $parsed['action'] = $action;
     $parsed = handleAction($action, $parsed, $session, $sessionId, $message);
@@ -253,7 +270,10 @@ function handleCheckUser(array $parsed, array &$session): array
     }
 
     $dniClean = preg_replace('/\D/', '', $dni);
-    if (strlen($dniClean) < 7) {
+    if (strlen($dniClean) < 7 || strlen($dniClean) > 8) {
+        unset($session['userData']['dni']);
+        $session['dbUser'] = null;
+        $session['userLookupDone'] = false;
         $parsed['assistant']['message'] = 'El DNI que ingresó no parece válido. Debe tener entre 7 y 8 dígitos. ¿Podría verificarlo?';
         $parsed['action'] = 'ask_dni';
         $parsed['validation']['invalid_fields'][] = 'dni';
@@ -327,12 +347,96 @@ function reconcileActionWithSession(string $action, array $session, array $parse
         }
     }
 
-    // Si tenemos DNI pero nunca se verificó, forzar check_user en vez de volver a pedir DNI.
-    if ($hasDni && !$lookupDone && $action === 'ask_dni') {
+    // Si tenemos DNI y nunca se verificó, forzar check_user sin depender del texto del LLM.
+    if ($hasDni && !$lookupDone && !in_array($action, ['check_user', 'check_case_status'], true)) {
         return 'check_user';
     }
 
     return $action;
+}
+
+/**
+ * Detecta la intención principal del mensaje para estabilizar el flujo.
+ */
+function detectConversationIntent(string $userMessage): ?string
+{
+    $msg = mb_strtolower(trim($userMessage), 'UTF-8');
+    if ($msg === '') {
+        return null;
+    }
+
+    $statusPatterns = [
+        '/\bestado\b/ui',
+        '/\bseguimiento\b/ui',
+        '/\bc[oó]mo\s+va\b/ui',
+        '/\bmi\s+caso\b/ui',
+        '/\bcaso\s*(?:n(?:u|ú)mero|nro|n|#)?\s*\d+\b/ui',
+        '/\bconsultar\b.*\bcaso\b/ui',
+    ];
+
+    foreach ($statusPatterns as $pattern) {
+        if (preg_match($pattern, $msg) === 1) {
+            return 'check_case_status';
+        }
+    }
+
+    $createPatterns = [
+        '/\bcargar\b.*\bcaso\b/ui',
+        '/\bcrear\b.*\bcaso\b/ui',
+        '/\bnuevo\s+caso\b/ui',
+        '/\bcargar\s+ticket\b/ui',
+        '/\bcrear\s+ticket\b/ui',
+        '/\bquiero\s+pedir\s+ayuda\b/ui',
+        '/\bnecesito\s+ayuda\b/ui',
+    ];
+
+    foreach ($createPatterns as $pattern) {
+        if (preg_match($pattern, $msg) === 1) {
+            return 'create_ticket_flow';
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Selecciona una acción segura para el flujo de carga de caso.
+ */
+function chooseCreateFlowAction(array $session): string
+{
+    $userData = $session['userData'] ?? [];
+    $problemData = $session['problemData'] ?? [];
+    $dbUser = $session['dbUser'] ?? null;
+    $lookupDone = !empty($session['userLookupDone']);
+
+    $hasDni = !empty($userData['dni']);
+    $hasNombre = !empty($userData['nombre']);
+    $hasTelefono = !empty($userData['telefono']);
+    $hasDescripcion = !empty($problemData['descripcion']);
+
+    if (!$hasDni) {
+        return 'ask_dni';
+    }
+
+    if (!$lookupDone) {
+        return 'check_user';
+    }
+
+    if (empty($dbUser)) {
+        if (!$hasNombre || !$hasTelefono) {
+            return 'register_user';
+        }
+        if (!$hasDescripcion) {
+            return 'ask_problem';
+        }
+        return 'confirm_data';
+    }
+
+    if (!$hasDescripcion) {
+        return 'ask_problem';
+    }
+
+    return 'confirm_data';
 }
 
 /**

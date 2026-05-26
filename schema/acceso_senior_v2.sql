@@ -165,11 +165,17 @@ CREATE TABLE IF NOT EXISTS `ai_sessions` (
 
 -- Tipos de problemas comunes
 INSERT INTO `problem_types` (`id`, `name`, `description`) VALUES
-  (1, 'Ayuda trámite', 'Ayuda para trámites en línea'),
-  (2, 'Cuenta/Password', 'Recupero o creación de cuentas'),
-  (3, 'Uso de dispositivo', 'Ayuda con el uso del celular, tablet o computadora'),
-  (4, 'Aplicaciones', 'Instalación o uso de aplicaciones'),
-  (5, 'Otro', 'Otro tipo de problema no listado')
+  (1, 'Acceso a la salud', 'Consultas y barreras vinculadas al acceso a servicios de salud'),
+  (2, 'Acceso a la vivienda', 'Problemas relacionados con vivienda, alquiler, tenencia o condiciones habitacionales'),
+  (3, 'Acceso al transporte', 'Dificultades para acceder y utilizar transporte publico o servicios de movilidad'),
+  (4, 'Acceso a la jubilacion', 'Consultas sobre tramites, requisitos y cobro de jubilacion o pension'),
+  (5, 'Autonomia digital', 'Acompanamiento para uso de tecnologia, dispositivos y herramientas digitales'),
+  (6, 'Funcionamiento sobre consultoria Acceso Senior', 'Consultas sobre como funciona la consultoria y sus servicios'),
+  (7, 'Reclamos servicios publicos', 'Reclamos vinculados a servicios publicos como agua, luz, gas o recoleccion'),
+  (8, 'Reclamos servicios privados', 'Reclamos a empresas privadas por facturacion, atencion o incumplimientos'),
+  (9, 'Derecho privado', 'Consultas vinculadas a relaciones entre particulares y derechos privados'),
+  (10, 'Acceso a la informacion publica', 'Solicitudes o dificultades para acceder a informacion publica'),
+  (11, 'Otro', 'Otro tipo de problema no listado')
 ON DUPLICATE KEY UPDATE `name` = VALUES(`name`);
 
 -- Centro de ejemplo
