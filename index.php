@@ -82,6 +82,7 @@ $routes = [
     ['GET',  '#^/api/cases/(?P<id>\d+)$#',                           'api/cases/get_by_id.php'],
 
     // ── Users ──
+    ['GET', '#^/api/users$#', 'api/users/list.php'],
     ['GET', '#^/api/users/me$#', 'api/users/get_profile.php'],
     ['PUT', '#^/api/users/me$#', 'api/users/update_profile.php'],
 

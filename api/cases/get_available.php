@@ -8,13 +8,19 @@
  * Respuesta: { "success": true, "data": [ {...}, ... ] }
  */
 
-$user = authRequired();
+$jwtUser = authRequired();
+$user = loadAuthenticatedUser($jwtUser);
 requireRole($user, 'facilitador');
 
+if (empty($user['center_id'])) {
+    jsonSuccess([]);
+}
+
 $pdo = getDB();
-$stmt = $pdo->query(
-    "SELECT * FROM cases WHERE facilitator_id IS NULL AND status = 'ingresado' ORDER BY created_at ASC"
+$stmt = $pdo->prepare(
+    "SELECT * FROM cases WHERE facilitator_id IS NULL AND status = 'ingresado' AND center_id = ? ORDER BY created_at ASC"
 );
+$stmt->execute([$user['center_id']]);
 $cases = $stmt->fetchAll();
 
 jsonSuccess($cases);

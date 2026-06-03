@@ -8,11 +8,12 @@
  * Respuesta: { "success": true, "data": [ {...}, ... ] }
  */
 
-$user = authRequired();
-requireRole($user, 'admin');
+$jwtUser = authRequired();
+$user = loadAuthenticatedUser($jwtUser);
+requireRole($user, 'admin', 'centro');
 
 $pdo = getDB();
-$stmt = $pdo->query(
+$sql =
 	"SELECT
 		c.*,
 		consultante.name AS consultante_name,
@@ -32,9 +33,19 @@ $stmt = $pdo->query(
 	 LEFT JOIN users consultante ON consultante.id = c.consultante_id
 	 LEFT JOIN users facilitator ON facilitator.id = c.facilitator_id
 	 LEFT JOIN centers ce ON ce.id = c.center_id
-	 LEFT JOIN problem_types pt ON pt.id = c.problem_type_id
-	 ORDER BY c.created_at DESC"
-);
+	 LEFT JOIN problem_types pt ON pt.id = c.problem_type_id";
+
+if ($user['role'] === 'centro') {
+	if (empty($user['center_id'])) {
+		jsonSuccess([]);
+	}
+
+	$stmt = $pdo->prepare($sql . ' WHERE c.center_id = ? ORDER BY c.created_at DESC');
+	$stmt->execute([$user['center_id']]);
+} else {
+	$stmt = $pdo->query($sql . ' ORDER BY c.created_at DESC');
+}
+
 $cases = $stmt->fetchAll();
 
 jsonSuccess($cases);

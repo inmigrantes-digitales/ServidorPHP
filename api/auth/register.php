@@ -8,6 +8,12 @@
  * Respuesta: { "success": true, "data": { id, name, email, phone, dni, role, center_id, zone } }
  */
 
+require_once __DIR__ . '/../../middleware/auth.php';
+require_once __DIR__ . '/../../middleware/role.php';
+
+$authUser = loadAuthenticatedUser(authRequired());
+requireRole($authUser, 'admin', 'centro');
+
 $body = getJsonBody();
 
 $name      = trim($body['name'] ?? '');
@@ -32,6 +38,22 @@ if (!isValidEmail($email)) {
 $allowedRoles = ['consultante', 'facilitador', 'centro', 'admin'];
 if (!in_array($role, $allowedRoles, true)) {
     jsonError('Rol no válido', 400);
+}
+
+if ($authUser['role'] === 'centro') {
+    if ($role !== 'facilitador') {
+        jsonError('El usuario centro solo puede crear facilitadores', 403);
+    }
+
+    if (empty($authUser['center_id'])) {
+        jsonError('El usuario centro no tiene un centro asignado', 403);
+    }
+
+    $centerId = (int)$authUser['center_id'];
+}
+
+if ($role !== 'admin' && empty($centerId)) {
+    jsonError('Los usuarios no admin deben tener un centro asignado', 400);
 }
 
 $pdo = getDB();

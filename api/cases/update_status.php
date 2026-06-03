@@ -10,8 +10,9 @@
  * Respuesta: { "success": true, "data": { "message": "Estado actualizado" } }
  */
 
-$user = authRequired();
-requireRole($user, 'facilitador', 'admin');
+$jwtUser = authRequired();
+$user = loadAuthenticatedUser($jwtUser);
+requireRole($user, 'facilitador', 'admin', 'centro');
 
 $caseId = $routeParams['id'] ?? null;
 if (!$caseId || !is_numeric($caseId)) {
@@ -29,12 +30,36 @@ if (!in_array($newStatus, $allowedStatuses, true)) {
 $pdo = getDB();
 
 // ── Obtener estado anterior ──
-$stmt = $pdo->prepare('SELECT id, status, facilitator_id FROM cases WHERE id = ?');
+$stmt = $pdo->prepare('SELECT id, status, facilitator_id, center_id FROM cases WHERE id = ?');
 $stmt->execute([$caseId]);
 $case = $stmt->fetch();
 
 if (!$case) {
     jsonError('Caso no encontrado', 404);
+}
+
+if ($user['role'] === 'facilitador') {
+    if (empty($user['center_id'])) {
+        jsonError('El facilitador no tiene un centro asignado', 403);
+    }
+
+    if ((int)($case['center_id'] ?? 0) !== (int)$user['center_id']) {
+        jsonError('Solo puedes actualizar casos de tu centro', 403);
+    }
+
+    if ((int)($case['facilitator_id'] ?? 0) !== (int)$user['id']) {
+        jsonError('Solo puedes actualizar casos asignados a tu usuario', 403);
+    }
+}
+
+if ($user['role'] === 'centro') {
+    if (empty($user['center_id'])) {
+        jsonError('El usuario centro no tiene un centro asignado', 403);
+    }
+
+    if ((int)($case['center_id'] ?? 0) !== (int)$user['center_id']) {
+        jsonError('Solo puedes actualizar casos de tu centro', 403);
+    }
 }
 
 $previousStatus = $case['status'];

@@ -28,6 +28,7 @@ require_once $baseDir . '/prompts/prompt.php';
 // ── Parámetros ──
 $sessionId = $_GET['sessionId'] ?? '';
 $message   = $_GET['message'] ?? '';
+$incomingLocation = extractIncomingLocation($_GET);
 
 if (empty($sessionId) || empty($message)) {
     jsonError('sessionId y message son requeridos', 400);
@@ -56,6 +57,10 @@ function sendSSE(string $data): void
 
 // ── Cargar o crear sesión ──
 $session = getAISession($sessionId);
+
+if (!empty($incomingLocation)) {
+    $session['location'] = $incomingLocation;
+}
 
 // Agregar mensaje del usuario al historial
 addToHistory($session, 'user', $message);
@@ -297,7 +302,7 @@ function handleCheckUser(array $parsed, array &$session): array
     } else {
         // Usuario no encontrado
         $session['dbUser'] = null;
-        $parsed['assistant']['message'] = 'No encontré una cuenta con ese DNI en nuestro sistema. No se preocupe, vamos a registrarlo. ¿Podría decirme su nombre completo (nombre y apellido)?';
+        $parsed['assistant']['message'] = 'Vamos a registrarlo. ¿Podría decirme su nombre completo (nombre y apellido)?';
         $parsed['action'] = 'register_user';
         $parsed['validation']['missing_fields'] = ['nombre', 'telefono'];
     }
@@ -520,25 +525,40 @@ function handleCreateTicket(array $parsed, array &$session, string $sessionId): 
     $descripcion = $problemData['descripcion'] ?? $parsed['data']['update']['descripcion'] ?? null;
     $categoria   = $problemData['categoria'] ?? $parsed['data']['update']['categoria'] ?? null;
     $problemTypeId = resolveProblemTypeId($categoria, $descripcion);
+    $location = $session['location'] ?? null;
 
     try {
         if ($dbUser && !empty($dbUser['id'])) {
             // Usuario existente → solo crear caso
-            $caseId = saveExistingUserCase((int)$dbUser['id'], $descripcion, $problemTypeId, $sessionId);
+            $caseResult = saveExistingUserCase((int)$dbUser['id'], $descripcion, $problemTypeId, $location, $sessionId);
+            $caseId = (int)$caseResult['caseId'];
             $nombre = $dbUser['name'] ?? 'estimado/a';
         } else {
             // Usuario nuevo → crear usuario + caso
-            $result = saveNewUserAndCase($userData, $descripcion, $problemTypeId, $sessionId);
-            $caseId = $result['caseId'];
+            $result = saveNewUserAndCase($userData, $descripcion, $problemTypeId, $location, $sessionId);
+            $caseId = (int)$result['caseId'];
             $session['dbUser'] = ['id' => $result['userId']];
             $nombre = $userData['nombre'] ?? 'estimado/a';
+            $caseResult = $result;
         }
 
-        $parsed['assistant']['message'] = "¡Listo, {$nombre}! Su consulta ha sido registrada exitosamente (N° {$caseId}). "
-            . "En breve, un facilitador se pondrá en contacto con usted para ayudarlo. "
-            . "¡Que tenga un excelente día!";
+        $centerName = $caseResult['centerName'] ?? null;
+        $centerText = $centerName ? " Se asignó al centro {$centerName}." : '';
+
+        $parsed['assistant']['message'] = "¡Listo, {$nombre}! Su consulta ha sido registrada exitosamente (N° {$caseId})."
+            . $centerText
+            . " En breve, un facilitador se pondrá en contacto con usted para ayudarlo."
+            . " ¡Que tenga un excelente día!";
         $parsed['action'] = 'finish';
         $parsed['process']['suggest_finish'] = true;
+        $parsed['data']['summary'] = [
+            'case_id' => $caseId,
+            'center_assigned' => [
+                'id' => $caseResult['centerId'] ?? null,
+                'name' => $centerName,
+                'distance_km' => $caseResult['centerDistanceKm'] ?? null,
+            ],
+        ];
 
     } catch (Exception $e) {
         error_log("[{$sessionId}] Error creando ticket: " . $e->getMessage());
@@ -561,19 +581,22 @@ function executeConfirmedAction(array &$session, string $sessionId): array
     $categoria   = $problemData['categoria'] ?? null;
     $problemTypeId = resolveProblemTypeId($categoria, $descripcion);
     $dbUser      = $session['dbUser'] ?? null;
+    $location    = $session['location'] ?? null;
 
     try {
         if ($dbUser && !empty($dbUser['id'])) {
-            $caseId = saveExistingUserCase((int)$dbUser['id'], $descripcion, $problemTypeId, $sessionId);
+            $caseResult = saveExistingUserCase((int)$dbUser['id'], $descripcion, $problemTypeId, $location, $sessionId);
+            $caseId = (int)$caseResult['caseId'];
             $nombre = $dbUser['name'] ?? $userData['nombre'] ?? 'estimado/a';
         } else {
-            $result = saveNewUserAndCase($userData, $descripcion, $problemTypeId, $sessionId);
-            $caseId = $result['caseId'];
+            $result = saveNewUserAndCase($userData, $descripcion, $problemTypeId, $location, $sessionId);
+            $caseId = (int)$result['caseId'];
             $session['dbUser'] = ['id' => $result['userId']];
             $nombre = $userData['nombre'] ?? 'estimado/a';
+            $caseResult = $result;
         }
 
-        return buildFinalResponse($nombre, $caseId);
+        return buildFinalResponse($nombre, $caseId, $caseResult['centerName'] ?? null, $caseResult['centerId'] ?? null, $caseResult['centerDistanceKm'] ?? null);
 
     } catch (Exception $e) {
         error_log("[{$sessionId}] Error en confirmación: " . $e->getMessage());
@@ -624,15 +647,25 @@ function buildDataSummary(array $session): array
 /**
  * Construye la respuesta final exitosa.
  */
-function buildFinalResponse(string $nombre, int $caseId): array
+function buildFinalResponse(string $nombre, int $caseId, ?string $centerName = null, ?int $centerId = null, ?float $centerDistanceKm = null): array
 {
+    $centerText = $centerName ? " Se asignó al centro {$centerName}." : '';
     $response = buildFallbackResponse(
-        "¡Listo, {$nombre}! Su consulta ha sido registrada exitosamente (N° {$caseId}). "
-        . "En breve, un facilitador se pondrá en contacto con usted para ayudarlo. "
+        "¡Listo, {$nombre}! Su consulta ha sido registrada exitosamente (N° {$caseId})."
+        . $centerText
+        . " En breve, un facilitador se pondrá en contacto con usted para ayudarlo. "
         . "¡Que tenga un excelente día!"
     );
     $response['action'] = 'finish';
     $response['process']['suggest_finish'] = true;
+    $response['data']['summary'] = [
+        'case_id' => $caseId,
+        'center_assigned' => [
+            'id' => $centerId,
+            'name' => $centerName,
+            'distance_km' => $centerDistanceKm,
+        ],
+    ];
     return $response;
 }
 
@@ -657,14 +690,33 @@ function findUserByDni(string $dniClean): ?array
 /**
  * Crea un caso para un usuario existente.
  */
-function saveExistingUserCase(int $userId, ?string $description, ?int $problemTypeId, string $sessionId): int
+function saveExistingUserCase(int $userId, ?string $description, ?int $problemTypeId, ?array $location, string $sessionId): array
 {
     $pdo = getDB();
+    $resolvedCenter = resolveCenterAssignment($pdo, $userId, $location);
+
+    if (!empty($resolvedCenter['centerId'])) {
+        syncConsultanteLocationData($pdo, $userId, $resolvedCenter);
+    }
+
+    $lat = $location['latitude'] ?? null;
+    $lng = $location['longitude'] ?? null;
+    $acc = $location['accuracy'] ?? null;
+
     $stmt = $pdo->prepare(
-        "INSERT INTO cases (consultante_id, problem_type_id, description, input_method, status, created_at)
-         VALUES (?, ?, ?, 'texto', 'ingresado', NOW())"
+        "INSERT INTO cases
+            (consultante_id, center_id, user_latitude, user_longitude, location_accuracy_meters, problem_type_id, description, input_method, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'texto', 'ingresado', NOW())"
     );
-    $stmt->execute([$userId, $problemTypeId, $description ?? '']);
+    $stmt->execute([
+        $userId,
+        $resolvedCenter['centerId'],
+        $lat,
+        $lng,
+        $acc,
+        $problemTypeId,
+        $description ?? '',
+    ]);
     $caseId = (int)$pdo->lastInsertId();
 
     // Registrar en historial de caso
@@ -674,15 +726,20 @@ function saveExistingUserCase(int $userId, ?string $description, ?int $problemTy
     );
     $stmt->execute([$caseId, $userId]);
 
-    error_log("[{$sessionId}] Caso creado - Usuario ID: {$userId}, Caso ID: {$caseId}");
-    return $caseId;
+    error_log("[{$sessionId}] Caso creado - Usuario ID: {$userId}, Caso ID: {$caseId}, Centro ID: " . ($resolvedCenter['centerId'] ?? 'null'));
+    return [
+        'caseId' => $caseId,
+        'centerId' => $resolvedCenter['centerId'],
+        'centerName' => $resolvedCenter['centerName'],
+        'centerDistanceKm' => $resolvedCenter['distanceKm'],
+    ];
 }
 
 /**
  * Crea un usuario nuevo + caso en una transacción.
  * Mapea campos del prompt (español) a columnas de BD (inglés).
  */
-function saveNewUserAndCase(array $userData, ?string $description, ?int $problemTypeId, string $sessionId): array
+function saveNewUserAndCase(array $userData, ?string $description, ?int $problemTypeId, ?array $location, string $sessionId): array
 {
     $pdo = getDB();
 
@@ -721,22 +778,40 @@ function saveNewUserAndCase(array $userData, ?string $description, ?int $problem
             }
         }
 
+        $resolvedCenter = resolveCenterAssignment($pdo, $consultanteId ? (int)$consultanteId : null, $location);
+        $resolvedZone = $resolvedCenter['centerZone'] ?? null;
+
         if (!$consultanteId) {
             // Crear usuario nuevo
             $stmt = $pdo->prepare(
-                "INSERT INTO users (name, dni, phone, email, role, created_at)
-                 VALUES (?, ?, ?, ?, 'consultante', NOW())"
+                "INSERT INTO users (name, dni, phone, email, role, center_id, zone, created_at)
+                 VALUES (?, ?, ?, ?, 'consultante', ?, ?, NOW())"
             );
-            $stmt->execute([$name, $dni, $phone, $email]);
+            $stmt->execute([$name, $dni, $phone, $email, $resolvedCenter['centerId'], $resolvedZone]);
             $consultanteId = (int)$pdo->lastInsertId();
+        } elseif (!empty($resolvedCenter['centerId'])) {
+            syncConsultanteLocationData($pdo, (int)$consultanteId, $resolvedCenter);
         }
 
         // Crear caso
+        $lat = $location['latitude'] ?? null;
+        $lng = $location['longitude'] ?? null;
+        $acc = $location['accuracy'] ?? null;
+
         $stmt = $pdo->prepare(
-              "INSERT INTO cases (consultante_id, problem_type_id, description, input_method, status, created_at)
-               VALUES (?, ?, ?, 'texto', 'ingresado', NOW())"
+            "INSERT INTO cases
+                (consultante_id, center_id, user_latitude, user_longitude, location_accuracy_meters, problem_type_id, description, input_method, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'texto', 'ingresado', NOW())"
         );
-           $stmt->execute([$consultanteId, $problemTypeId, $description ?? '']);
+        $stmt->execute([
+            $consultanteId,
+            $resolvedCenter['centerId'],
+            $lat,
+            $lng,
+            $acc,
+            $problemTypeId,
+            $description ?? '',
+        ]);
         $caseId = (int)$pdo->lastInsertId();
 
         // Historial del caso
@@ -748,13 +823,157 @@ function saveNewUserAndCase(array $userData, ?string $description, ?int $problem
 
         $pdo->commit();
 
-        error_log("[{$sessionId}] Usuario nuevo + caso creados - Usuario ID: {$consultanteId}, Caso ID: {$caseId}");
-        return ['userId' => $consultanteId, 'caseId' => $caseId];
+        error_log("[{$sessionId}] Usuario nuevo + caso creados - Usuario ID: {$consultanteId}, Caso ID: {$caseId}, Centro ID: " . ($resolvedCenter['centerId'] ?? 'null'));
+        return [
+            'userId' => $consultanteId,
+            'caseId' => $caseId,
+            'centerId' => $resolvedCenter['centerId'],
+            'centerName' => $resolvedCenter['centerName'],
+            'centerDistanceKm' => $resolvedCenter['distanceKm'],
+        ];
 
     } catch (Exception $e) {
         $pdo->rollBack();
         throw $e;
     }
+}
+
+/**
+ * Sincroniza centro y zona del consultante usando el centro resuelto
+ * a partir de la ubicación actual enviada por el frontend.
+ */
+function syncConsultanteLocationData(PDO $pdo, int $userId, array $resolvedCenter): void
+{
+    $stmt = $pdo->prepare(
+        'UPDATE users
+         SET center_id = ?, zone = ?, updated_at = NOW()
+         WHERE id = ?'
+    );
+    $stmt->execute([
+        $resolvedCenter['centerId'] ?? null,
+        $resolvedCenter['centerZone'] ?? null,
+        $userId,
+    ]);
+}
+
+/**
+ * Determina el centro a asignar priorizando cercanía por geolocalización.
+ */
+function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location): array
+{
+    $latitude = $location['latitude'] ?? null;
+    $longitude = $location['longitude'] ?? null;
+
+    if ($latitude !== null && $longitude !== null) {
+        $nearest = findNearestCenterByCoordinates($pdo, (float)$latitude, (float)$longitude);
+        if ($nearest) {
+            return [
+                'centerId' => (int)$nearest['id'],
+                'centerName' => $nearest['name'] ?? null,
+                'centerZone' => $nearest['zone'] ?? null,
+                'distanceKm' => isset($nearest['distance_km']) ? round((float)$nearest['distance_km'], 2) : null,
+            ];
+        }
+    }
+
+    if (!empty($consultanteId)) {
+        $stmt = $pdo->prepare(
+            'SELECT c.id, c.name, c.zone
+             FROM users u
+             LEFT JOIN centers c ON c.id = u.center_id
+             WHERE u.id = ?
+             LIMIT 1'
+        );
+        $stmt->execute([$consultanteId]);
+        $userCenter = $stmt->fetch();
+        if (!empty($userCenter['id'])) {
+            return [
+                'centerId' => (int)$userCenter['id'],
+                'centerName' => $userCenter['name'] ?? null,
+                'centerZone' => $userCenter['zone'] ?? null,
+                'distanceKm' => null,
+            ];
+        }
+    }
+
+    $fallback = $pdo->query('SELECT id, name, zone FROM centers ORDER BY id ASC LIMIT 1')->fetch();
+    if ($fallback) {
+        return [
+            'centerId' => (int)$fallback['id'],
+            'centerName' => $fallback['name'] ?? null,
+            'centerZone' => $fallback['zone'] ?? null,
+            'distanceKm' => null,
+        ];
+    }
+
+    return [
+        'centerId' => null,
+        'centerName' => null,
+        'centerZone' => null,
+        'distanceKm' => null,
+    ];
+}
+
+/**
+ * Busca el centro más cercano en base a latitud/longitud.
+ */
+function findNearestCenterByCoordinates(PDO $pdo, float $latitude, float $longitude): ?array
+{
+    $stmt = $pdo->prepare(
+        "SELECT
+            c.id,
+            c.name,
+            c.zone,
+            (
+                6371 * ACOS(
+                    COS(RADIANS(?)) * COS(RADIANS(c.latitude)) * COS(RADIANS(c.longitude) - RADIANS(?))
+                    + SIN(RADIANS(?)) * SIN(RADIANS(c.latitude))
+                )
+            ) AS distance_km
+         FROM centers c
+         WHERE c.latitude IS NOT NULL AND c.longitude IS NOT NULL
+         ORDER BY distance_km ASC
+         LIMIT 1"
+    );
+    $stmt->execute([$latitude, $longitude, $latitude]);
+    $row = $stmt->fetch();
+
+    return $row ?: null;
+}
+
+/**
+ * Extrae y valida geolocalización enviada por el cliente.
+ */
+function extractIncomingLocation(array $query): ?array
+{
+    $hasLat = array_key_exists('latitude', $query);
+    $hasLng = array_key_exists('longitude', $query);
+
+    if (!$hasLat || !$hasLng) {
+        return null;
+    }
+
+    $latitude = (float)$query['latitude'];
+    $longitude = (float)$query['longitude'];
+    $accuracy = array_key_exists('accuracy', $query) ? (float)$query['accuracy'] : null;
+
+    if ($latitude < -90 || $latitude > 90) {
+        return null;
+    }
+
+    if ($longitude < -180 || $longitude > 180) {
+        return null;
+    }
+
+    if ($accuracy !== null && $accuracy < 0) {
+        $accuracy = null;
+    }
+
+    return [
+        'latitude' => $latitude,
+        'longitude' => $longitude,
+        'accuracy' => $accuracy,
+    ];
 }
 
 /**

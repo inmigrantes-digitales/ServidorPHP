@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS `centers` (
   `name` VARCHAR(255) NOT NULL COMMENT 'Nombre del centro comunitario',
   `address` VARCHAR(255) DEFAULT NULL COMMENT 'Dirección física del centro',
   `zone` VARCHAR(100) DEFAULT NULL COMMENT 'Zona o barrio del centro',
+  `latitude` DECIMAL(10,7) DEFAULT NULL COMMENT 'Latitud del centro (WGS84)',
+  `longitude` DECIMAL(10,7) DEFAULT NULL COMMENT 'Longitud del centro (WGS84)',
   `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -90,6 +92,9 @@ CREATE TABLE IF NOT EXISTS `cases` (
   `consultante_id` INT(11) DEFAULT NULL COMMENT 'Usuario que registra la consulta',
   `facilitator_id` INT(11) DEFAULT NULL COMMENT 'Facilitador asignado al caso',
   `center_id` INT(11) DEFAULT NULL COMMENT 'Centro comunitario donde se registró',
+  `user_latitude` DECIMAL(10,7) DEFAULT NULL COMMENT 'Latitud reportada del usuario al crear el caso',
+  `user_longitude` DECIMAL(10,7) DEFAULT NULL COMMENT 'Longitud reportada del usuario al crear el caso',
+  `location_accuracy_meters` DECIMAL(8,2) DEFAULT NULL COMMENT 'Precisión de geolocalización en metros',
   `problem_type_id` INT(11) DEFAULT NULL COMMENT 'Tipo de problema (puede ser NULL si la IA no lo asigna)',
   `description` TEXT DEFAULT NULL COMMENT 'Descripción del problema reportado',
   `input_method` ENUM('voz','texto','centro') NOT NULL DEFAULT 'texto'
@@ -179,8 +184,8 @@ INSERT INTO `problem_types` (`id`, `name`, `description`) VALUES
 ON DUPLICATE KEY UPDATE `name` = VALUES(`name`);
 
 -- Centro de ejemplo
-INSERT INTO `centers` (`id`, `name`, `address`, `zone`, `created_at`) VALUES
-  (1, 'Centro de Ayuda Comunitario', 'Cabildo 1124', 'Liniers', NOW())
+INSERT INTO `centers` (`id`, `name`, `address`, `zone`, `latitude`, `longitude`, `created_at`) VALUES
+  (1, 'Centro de Ayuda Comunitario', 'Cabildo 1124', 'Liniers', -34.6431110, -58.5047770, NOW())
 ON DUPLICATE KEY UPDATE `name` = VALUES(`name`);
 
 -- Usuarios de ejemplo (passwords: "123456" hasheados con bcrypt cost=10)

@@ -51,3 +51,30 @@ function authRequired(): array
 
     return $decoded;
 }
+
+/**
+ * Carga el usuario autenticado desde la base de datos para obtener
+ * campos actualizados como center_id y validar que el usuario siga activo.
+ *
+ * @param array $jwtUser Datos decodificados del JWT.
+ * @return array Usuario actual desde la tabla users.
+ */
+function loadAuthenticatedUser(array $jwtUser): array
+{
+    if (empty($jwtUser['id'])) {
+        jsonError('Token inválido: usuario no identificado', 403);
+    }
+
+    $pdo = getDB();
+    $stmt = $pdo->prepare(
+        'SELECT id, name, email, phone, dni, role, center_id, zone, address FROM users WHERE id = ? LIMIT 1'
+    );
+    $stmt->execute([$jwtUser['id']]);
+    $dbUser = $stmt->fetch();
+
+    if (!$dbUser) {
+        jsonError('Usuario no encontrado', 404);
+    }
+
+    return $dbUser;
+}

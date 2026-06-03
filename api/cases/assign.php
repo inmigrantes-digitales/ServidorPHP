@@ -9,8 +9,13 @@
  * Respuesta: { "success": true, "data": { "message": "Caso asignado" } }
  */
 
-$user = authRequired();
+$jwtUser = authRequired();
+$user = loadAuthenticatedUser($jwtUser);
 requireRole($user, 'facilitador');
+
+if (empty($user['center_id'])) {
+    jsonError('El facilitador no tiene un centro asignado', 403);
+}
 
 // $routeParams['id'] es inyectado por el router (index.php)
 $caseId = $routeParams['id'] ?? null;
@@ -21,7 +26,7 @@ if (!$caseId || !is_numeric($caseId)) {
 $pdo = getDB();
 
 // ── Verificar que el caso existe y está disponible ──
-$stmt = $pdo->prepare('SELECT id, status, facilitator_id FROM cases WHERE id = ?');
+$stmt = $pdo->prepare('SELECT id, status, facilitator_id, center_id FROM cases WHERE id = ?');
 $stmt->execute([$caseId]);
 $case = $stmt->fetch();
 
@@ -31,6 +36,10 @@ if (!$case) {
 
 if ($case['facilitator_id'] !== null) {
     jsonError('El caso ya tiene un facilitador asignado', 409);
+}
+
+if ((int)($case['center_id'] ?? 0) !== (int)$user['center_id']) {
+    jsonError('Solo puedes tomar casos de tu centro', 403);
 }
 
 // ── Asignar facilitador ──
