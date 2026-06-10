@@ -18,7 +18,11 @@ if (empty($user['center_id'])) {
 
 $pdo = getDB();
 $stmt = $pdo->prepare(
-    'SELECT * FROM cases WHERE facilitator_id = ? AND center_id = ? ORDER BY created_at DESC'
+    'SELECT c.*, u.name, u.email, u.phone, u.zone
+    FROM cases c
+    LEFT JOIN users u ON c.consultante_id = u.id
+    WHERE c.facilitator_id = ? AND c.center_id = ?
+    ORDER BY c.created_at DESC'
 );
 $stmt->execute([$user['id'], $user['center_id']]);
 $cases = $stmt->fetchAll();
