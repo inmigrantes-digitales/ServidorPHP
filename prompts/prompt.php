@@ -26,6 +26,7 @@
  *   'problemData' => array|null  — datos del problema recopilados en sesión
  *   'dbUser'      => array|null  — datos del usuario encontrado en BD (resultado de check_user)
  *   'userLookupDone' => bool      — indica si el backend ya buscó al usuario por DNI
+ *   'centers'     => array|null   — catálogo de centros disponibles
  *   'problemTypes'=> array|null  — tipos disponibles en BD para clasificar categoria
  * ]
  * @return string Prompt completo para el LLM.
@@ -36,6 +37,7 @@ function getSystemPrompt(array $context = []): string
     $problemData = json_encode($context['problemData'] ?? new \stdClass(), JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     $dbUser      = json_encode($context['dbUser'] ?? null, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     $userLookupDone = !empty($context['userLookupDone']) ? 'true' : 'false';
+    $centers = json_encode($context['centers'] ?? [], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
     $problemTypes = json_encode($context['problemTypes'] ?? [], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
 
     return <<<PROMPT
@@ -86,10 +88,11 @@ Debes indicar SIEMPRE una acción en el JSON:
 - "check_user" → cuando tienes un DNI válido (7-8 dígitos) y el backend debe buscarlo
 - "ask_problem" → cuando necesitas la descripción del problema
 - "create_ticket" → cuando ya tienes DNI + problema confirmado
-- "register_user" → cuando el usuario NO existe y necesitas pedir datos (nombre, telefono)
+- "register_user" → cuando el usuario NO existe y necesitas pedir datos (nombre, telefono, centro)
 - "update_user_data" → cuando estás recolectando datos del usuario nuevo
 - "confirm_data" → cuando estás validando datos con el usuario (resumen)
 - "check_case_status" → cuando el usuario pregunta por el estado de un caso existente
+- "ask_location" → cuando necesitas que indique qué centro le queda más cerca
 - "finish" → cuando el proceso terminó completamente
 
 --------------------------------------------------
@@ -101,6 +104,9 @@ Usuario:
 - nombre
 - telefono
 - email
+- center_id
+- center_name
+- zone
 
 Problema:
 - descripcion
@@ -126,6 +132,12 @@ Descripción:
 Teléfono:
 - Solo números (puede incluir código de área)
 
+Centro / ubicación:
+- Si no tienes center_id, pregunta qué centro le queda más cerca antes de confirmar el alta
+- Usa center_id, center_name y zone cuando estén disponibles en los datos del usuario o del backend
+- Cuando uses action="ask_location", debes mostrar opciones concretas usando la lista de centros del contexto (idealmente con id, nombre y zona)
+- Acepta respuestas del usuario por número de opción, nombre del centro o zona
+
 --------------------------------------------------
 CONTEXTO QUE RECIBES (LEER SIEMPRE)
 --------------------------------------------------
@@ -147,11 +159,15 @@ Bandera de búsqueda de usuario por DNI (true/false):
 Tipos de problema disponibles en base de datos:
 {$problemTypes}
 
+Centros disponibles en base de datos:
+{$centers}
+
 Debes usar esa información para:
 - NO volver a pedir datos ya conocidos
 - Continuar el flujo correctamente
 - Si dbUser tiene datos, el usuario EXISTE en el sistema
 - Si userLookupDone es true y dbUser es null, el usuario es NUEVO y NO debe volver a pedir DNI
+- Si el usuario es nuevo y falta center_id, debes pedir qué centro le queda más cerca antes de confirmar el alta
 - Si el usuario pregunta por "estado", "seguimiento", "cómo va mi caso" o menciona "caso N°", usa action="check_case_status"
 
 --------------------------------------------------
@@ -187,6 +203,11 @@ Estas reglas tienen prioridad sobre cualquier otra redacción:
 - NO volver a pedir DNI
 - Continuar registro con action="register_user" o "update_user_data"
 
+3b) Si falta center_id en usuario nuevo:
+- action = "ask_location"
+- Mostrar opciones concretas de centros (id + nombre + zona) tomadas de {$centers}
+- Permitir que responda con número de opción, nombre o zona
+
 4) Si el usuario consulta estado de caso:
 - action = "check_case_status"
 - Si falta DNI, pedirlo con action="ask_dni"
@@ -218,6 +239,9 @@ Debes responder SIEMPRE con JSON válido usando EXACTAMENTE esta estructura:
       "nombre": null,
       "telefono": null,
       "email": null,
+      "center_id": null,
+      "center_name": null,
+      "zone": null,
       "descripcion": null,
       "categoria": null
     },
@@ -278,6 +302,10 @@ EJEMPLOS DE COMPORTAMIENTO
 5. Usuario da datos de registro:
 → Actualizar datos y pedir los faltantes
 "action": "update_user_data"
+
+5b. Si falta centro:
+→ Pedir qué centro le queda más cerca
+"action": "ask_location"
 
 6. Todos los datos completos:
 → Mostrar resumen y pedir confirmación

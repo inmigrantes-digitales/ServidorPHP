@@ -28,7 +28,6 @@ require_once $baseDir . '/prompts/prompt.php';
 // ── Parámetros ──
 $sessionId = $_GET['sessionId'] ?? '';
 $message   = $_GET['message'] ?? '';
-$incomingLocation = extractIncomingLocation($_GET);
 
 if (empty($sessionId) || empty($message)) {
     jsonError('sessionId y message son requeridos', 400);
@@ -57,10 +56,6 @@ function sendSSE(string $data): void
 
 // ── Cargar o crear sesión ──
 $session = getAISession($sessionId);
-
-if (!empty($incomingLocation)) {
-    $session['location'] = $incomingLocation;
-}
 
 // Agregar mensaje del usuario al historial
 addToHistory($session, 'user', $message);
@@ -92,6 +87,7 @@ try {
         'problemData' => $session['problemData'] ?? [],
         'dbUser'      => $session['dbUser'] ?? null,
         'userLookupDone' => !empty($session['userLookupDone']),
+        'centers'     => getCentersForPrompt(),
         'problemTypes' => getProblemTypesForPrompt(),
     ];
 
@@ -121,6 +117,15 @@ try {
     // Aceptamos 7-10 dígitos para capturar entradas mal formateadas y validarlas luego.
     if (empty($parsed['data']['update']['dni']) && preg_match('/\b(\d{7,10})\b/', $message, $dniMatch)) {
         $parsed['data']['update']['dni'] = $dniMatch[1];
+    }
+
+    // Si estamos en alta de usuario y no hay center_id explícito,
+    // intentar resolver el centro desde el mensaje (nombre/zona/id).
+    if (!empty($session['userLookupDone']) && empty($session['dbUser']) && empty($parsed['data']['update']['center_id'])) {
+        $centerFromText = inferCenterSelectionFromMessage($message, $parsed['data']['update'] ?? []);
+        if (!empty($centerFromText)) {
+            $parsed['data']['update'] = array_merge($parsed['data']['update'] ?? [], $centerFromText);
+        }
     }
 
     // ── Actualizar datos de sesión con lo que extrajo el LLM ──
@@ -178,6 +183,9 @@ function handleAction(string $action, array $parsed, array &$session, string $se
         case 'update_user_data':
             // Solo acumular datos — ya se hizo en mergeSessionData
             return $parsed;
+
+        case 'ask_location':
+            return handleAskLocation($parsed, $session);
 
         case 'confirm_data':
             $session['awaitingConfirmation'] = true;
@@ -302,9 +310,9 @@ function handleCheckUser(array $parsed, array &$session): array
     } else {
         // Usuario no encontrado
         $session['dbUser'] = null;
-        $parsed['assistant']['message'] = 'Vamos a registrarlo. ¿Podría decirme su nombre completo (nombre y apellido)?';
-        $parsed['action'] = 'register_user';
-        $parsed['validation']['missing_fields'] = ['nombre', 'telefono'];
+        $parsed['assistant']['message'] = 'Vamos a registrarlo. ¿Podría decirme su nombre completo (nombre y apellido )?';
+        $parsed['action'] = 'ask_location';
+        $parsed['validation']['missing_fields'] = ['nombre', 'telefono', 'center_id'];
     }
 
     return $parsed;
@@ -323,9 +331,14 @@ function reconcileActionWithSession(string $action, array $session, array $parse
     $hasDni = !empty($userData['dni']);
     $hasNombre = !empty($userData['nombre']);
     $hasTelefono = !empty($userData['telefono']);
+    $hasCenter = !empty($userData['center_id']) || !empty($userData['center_name']);
     $hasDescripcion = !empty($problemData['descripcion']);
 
     if ($action === 'check_case_status') {
+        return $action;
+    }
+
+    if ($action === 'ask_location') {
         return $action;
     }
 
@@ -333,6 +346,9 @@ function reconcileActionWithSession(string $action, array $session, array $parse
     if ($lookupDone && empty($dbUser)) {
         if (!$hasNombre || !$hasTelefono) {
             return 'register_user';
+        }
+        if (!$hasCenter) {
+            return 'ask_location';
         }
         if (!$hasDescripcion) {
             return 'ask_problem';
@@ -347,7 +363,7 @@ function reconcileActionWithSession(string $action, array $session, array $parse
         if (!$hasDescripcion) {
             return 'ask_problem';
         }
-        if (in_array($action, ['ask_dni', 'check_user', 'register_user', 'update_user_data'], true)) {
+        if (in_array($action, ['ask_dni', 'check_user', 'register_user', 'update_user_data', 'ask_location'], true)) {
             return 'confirm_data';
         }
     }
@@ -417,6 +433,7 @@ function chooseCreateFlowAction(array $session): string
     $hasDni = !empty($userData['dni']);
     $hasNombre = !empty($userData['nombre']);
     $hasTelefono = !empty($userData['telefono']);
+    $hasCenter = !empty($userData['center_id']) || !empty($userData['center_name']);
     $hasDescripcion = !empty($problemData['descripcion']);
 
     if (!$hasDni) {
@@ -430,6 +447,9 @@ function chooseCreateFlowAction(array $session): string
     if (empty($dbUser)) {
         if (!$hasNombre || !$hasTelefono) {
             return 'register_user';
+        }
+        if (!$hasCenter) {
+            return 'ask_location';
         }
         if (!$hasDescripcion) {
             return 'ask_problem';
@@ -456,6 +476,143 @@ function extractRequestedCaseId(string $userMessage): ?int
         return (int)$m[1];
     }
     return null;
+}
+
+/**
+ * Fuerza una pregunta de centro con opciones explícitas para el usuario.
+ */
+function handleAskLocation(array $parsed, array $session): array
+{
+    $centers = getCentersForPrompt();
+    $options = formatCentersOptionsForPrompt($centers);
+
+    $baseMessage = trim((string)($parsed['assistant']['message'] ?? ''));
+    if ($baseMessage === '') {
+        $baseMessage = 'Por favor, indíqueme qué centro de Acceso Senior le queda más cerca.';
+    }
+
+    $parsed['assistant']['message'] = $baseMessage
+        /* . "\n\nOpciones disponibles:\n"
+        . $options
+        . "\n\nPuede responder con el número de opción o con el nombre del centro." */;
+
+    $parsed['validation']['missing_fields'] = array_values(array_unique(array_merge(
+        $parsed['validation']['missing_fields'] ?? [],
+        ['center_id']
+    )));
+
+    $parsed['data']['summary']['center_options'] = array_map(static function (array $c): array {
+        return [
+            'id' => $c['id'],
+            'name' => $c['name'],
+            'zone' => $c['zone'] ?? null,
+        ];
+    }, $centers);
+
+    return $parsed;
+}
+
+/**
+ * Convierte una selección textual de centro a center_id/name/zone.
+ */
+function inferCenterSelectionFromMessage(string $message, array $update): ?array
+{
+    $centers = getCentersForPrompt();
+    if (empty($centers)) {
+        return null;
+    }
+
+    $byId = [];
+    foreach ($centers as $center) {
+        $byId[(int)$center['id']] = $center;
+    }
+
+    if (!empty($update['center_id'])) {
+        $id = (int)$update['center_id'];
+        if (!empty($byId[$id])) {
+            return [
+                'center_id' => $id,
+                'center_name' => $byId[$id]['name'],
+                'zone' => $byId[$id]['zone'] ?? null,
+            ];
+        }
+    }
+
+    $normalize = static function (?string $value): string {
+        $value = trim((string)$value);
+        if ($value === '') {
+            return '';
+        }
+        $value = mb_strtolower($value, 'UTF-8');
+        $value = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value) ?: $value;
+        $value = preg_replace('/[^a-z0-9\s]/', ' ', $value);
+        $value = preg_replace('/\s+/', ' ', $value);
+        return trim($value);
+    };
+
+    $messageNorm = $normalize($message);
+    $centerNameNorm = $normalize($update['center_name'] ?? '');
+
+    if (preg_match('/\b(?:opcion|opción|centro|id)?\s*(\d{1,4})\b/ui', $message, $m)) {
+        $candidateId = (int)$m[1];
+        if (!empty($byId[$candidateId])) {
+            return [
+                'center_id' => $candidateId,
+                'center_name' => $byId[$candidateId]['name'],
+                'zone' => $byId[$candidateId]['zone'] ?? null,
+            ];
+        }
+    }
+
+    foreach ($centers as $center) {
+        $nameNorm = $normalize($center['name'] ?? '');
+        $zoneNorm = $normalize($center['zone'] ?? '');
+
+        if ($centerNameNorm !== '' && ($centerNameNorm === $nameNorm || str_contains($nameNorm, $centerNameNorm))) {
+            return [
+                'center_id' => (int)$center['id'],
+                'center_name' => $center['name'],
+                'zone' => $center['zone'] ?? null,
+            ];
+        }
+
+        if ($nameNorm !== '' && str_contains($messageNorm, $nameNorm)) {
+            return [
+                'center_id' => (int)$center['id'],
+                'center_name' => $center['name'],
+                'zone' => $center['zone'] ?? null,
+            ];
+        }
+
+        if ($zoneNorm !== '' && str_contains($messageNorm, $zoneNorm)) {
+            return [
+                'center_id' => (int)$center['id'],
+                'center_name' => $center['name'],
+                'zone' => $center['zone'] ?? null,
+            ];
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Formatea el listado de centros para mostrar en el chat.
+ */
+function formatCentersOptionsForPrompt(array $centers): string
+{
+    if (empty($centers)) {
+        return '- No hay centros disponibles en este momento.';
+    }
+
+    $lines = [];
+    foreach ($centers as $center) {
+        $zone = trim((string)($center['zone'] ?? ''));
+        $zoneText = $zone !== '' ? " - zona {$zone}" : '';
+        $lines[] = '- [' . (int)$center['id'] . '] ' . $center['name'] . $zoneText;
+    }
+
+    return implode("\n", $lines);
 }
 
 /**
@@ -616,7 +773,7 @@ function executeConfirmedAction(array &$session, string $sessionId): array
 function mergeSessionData(array &$session, array $update): void
 {
     // Campos de usuario
-    $userFields = ['dni', 'nombre', 'telefono', 'email'];
+    $userFields = ['dni', 'nombre', 'telefono', 'email', 'center_id', 'center_name', 'zone'];
     foreach ($userFields as $field) {
         if (!empty($update[$field])) {
             $session['userData'][$field] = $update[$field];
@@ -748,6 +905,8 @@ function saveNewUserAndCase(array $userData, ?string $description, ?int $problem
     $dni      = !empty($userData['dni']) ? preg_replace('/\D/', '', $userData['dni']) : null;
     $phone    = !empty($userData['telefono']) ? preg_replace('/\D/', '', $userData['telefono']) : null;
     $email    = $userData['email'] ?? null;
+    $preferredCenterId = !empty($userData['center_id']) ? (int)$userData['center_id'] : null;
+    $preferredCenterName = $userData['center_name'] ?? null;
 
     $pdo->beginTransaction();
 
@@ -778,7 +937,7 @@ function saveNewUserAndCase(array $userData, ?string $description, ?int $problem
             }
         }
 
-        $resolvedCenter = resolveCenterAssignment($pdo, $consultanteId ? (int)$consultanteId : null, $location);
+        $resolvedCenter = resolveCenterAssignment($pdo, $consultanteId ? (int)$consultanteId : null, null, $preferredCenterId, $preferredCenterName);
         $resolvedZone = $resolvedCenter['centerZone'] ?? null;
 
         if (!$consultanteId) {
@@ -859,20 +1018,37 @@ function syncConsultanteLocationData(PDO $pdo, int $userId, array $resolvedCente
 /**
  * Determina el centro a asignar priorizando cercanía por geolocalización.
  */
-function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location): array
+function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location = null, ?int $preferredCenterId = null, ?string $preferredCenterName = null): array
 {
-    $latitude = $location['latitude'] ?? null;
-    $longitude = $location['longitude'] ?? null;
-
-    if ($latitude !== null && $longitude !== null) {
-        $nearest = findNearestCenterByCoordinates($pdo, (float)$latitude, (float)$longitude);
-        if ($nearest) {
+    if (!empty($preferredCenterId)) {
+        $stmt = $pdo->prepare('SELECT id, name, zone FROM centers WHERE id = ? LIMIT 1');
+        $stmt->execute([$preferredCenterId]);
+        $preferred = $stmt->fetch();
+        if ($preferred) {
             return [
-                'centerId' => (int)$nearest['id'],
-                'centerName' => $nearest['name'] ?? null,
-                'centerZone' => $nearest['zone'] ?? null,
-                'distanceKm' => isset($nearest['distance_km']) ? round((float)$nearest['distance_km'], 2) : null,
+                'centerId' => (int)$preferred['id'],
+                'centerName' => $preferred['name'] ?? null,
+                'centerZone' => $preferred['zone'] ?? null,
+                'distanceKm' => null,
+                'source' => 'manual_center',
             ];
+        }
+    }
+
+    if (!empty($preferredCenterName)) {
+        $preferredName = mb_strtolower(trim((string)$preferredCenterName), 'UTF-8');
+        $stmt = $pdo->query('SELECT id, name, zone FROM centers ORDER BY name ASC');
+        foreach ($stmt->fetchAll() ?: [] as $center) {
+            $centerName = mb_strtolower(trim((string)($center['name'] ?? '')), 'UTF-8');
+            if ($preferredName !== '' && ($preferredName === $centerName || str_contains($centerName, $preferredName))) {
+                return [
+                    'centerId' => (int)$center['id'],
+                    'centerName' => $center['name'] ?? null,
+                    'centerZone' => $center['zone'] ?? null,
+                    'distanceKm' => null,
+                    'source' => 'manual_center_name',
+                ];
+            }
         }
     }
 
@@ -892,6 +1068,7 @@ function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location
                 'centerName' => $userCenter['name'] ?? null,
                 'centerZone' => $userCenter['zone'] ?? null,
                 'distanceKm' => null,
+                'source' => 'user_center',
             ];
         }
     }
@@ -903,6 +1080,7 @@ function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location
             'centerName' => $fallback['name'] ?? null,
             'centerZone' => $fallback['zone'] ?? null,
             'distanceKm' => null,
+            'source' => 'fallback',
         ];
     }
 
@@ -911,69 +1089,36 @@ function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location
         'centerName' => null,
         'centerZone' => null,
         'distanceKm' => null,
+        'source' => null,
     ];
 }
 
 /**
- * Busca el centro más cercano en base a latitud/longitud.
+ * Obtiene los centros disponibles para que el prompt pueda sugerir el más cercano.
  */
-function findNearestCenterByCoordinates(PDO $pdo, float $latitude, float $longitude): ?array
+function getCentersForPrompt(): array
 {
-    $stmt = $pdo->prepare(
-        "SELECT
-            c.id,
-            c.name,
-            c.zone,
-            (
-                6371 * ACOS(
-                    COS(RADIANS(?)) * COS(RADIANS(c.latitude)) * COS(RADIANS(c.longitude) - RADIANS(?))
-                    + SIN(RADIANS(?)) * SIN(RADIANS(c.latitude))
-                )
-            ) AS distance_km
-         FROM centers c
-         WHERE c.latitude IS NOT NULL AND c.longitude IS NOT NULL
-         ORDER BY distance_km ASC
-         LIMIT 1"
-    );
-    $stmt->execute([$latitude, $longitude, $latitude]);
-    $row = $stmt->fetch();
-
-    return $row ?: null;
-}
-
-/**
- * Extrae y valida geolocalización enviada por el cliente.
- */
-function extractIncomingLocation(array $query): ?array
-{
-    $hasLat = array_key_exists('latitude', $query);
-    $hasLng = array_key_exists('longitude', $query);
-
-    if (!$hasLat || !$hasLng) {
-        return null;
+    static $cache = null;
+    if ($cache !== null) {
+        return $cache;
     }
 
-    $latitude = (float)$query['latitude'];
-    $longitude = (float)$query['longitude'];
-    $accuracy = array_key_exists('accuracy', $query) ? (float)$query['accuracy'] : null;
+    $pdo = getDB();
+    $stmt = $pdo->query('SELECT id, name, address, zone, latitude, longitude FROM centers ORDER BY name ASC');
+    $rows = $stmt->fetchAll() ?: [];
 
-    if ($latitude < -90 || $latitude > 90) {
-        return null;
-    }
+    $cache = array_map(static function (array $row): array {
+        return [
+            'id' => (int)$row['id'],
+            'name' => (string)$row['name'],
+            'address' => (string)($row['address'] ?? ''),
+            'zone' => (string)($row['zone'] ?? ''),
+            'latitude' => isset($row['latitude']) ? (float)$row['latitude'] : null,
+            'longitude' => isset($row['longitude']) ? (float)$row['longitude'] : null,
+        ];
+    }, $rows);
 
-    if ($longitude < -180 || $longitude > 180) {
-        return null;
-    }
-
-    if ($accuracy !== null && $accuracy < 0) {
-        $accuracy = null;
-    }
-
-    return [
-        'latitude' => $latitude,
-        'longitude' => $longitude,
-        'accuracy' => $accuracy,
-    ];
+    return $cache;
 }
 
 /**
