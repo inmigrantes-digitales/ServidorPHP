@@ -106,30 +106,55 @@ function validateProblemFields(array $problemData): array
 /**
  * Detecta si el mensaje del usuario es una confirmación, un rechazo, o indeterminado.
  *
+ * Solo interpreta el mensaje como sí/no cuando es una respuesta corta y directa
+ * (pocas palabras) y la palabra clave aparece completa, no como substring dentro
+ * de otra palabra o de una oración larga no relacionada (p. ej. "bien" dentro de
+ * "bien, tengo otra consulta" ya no debe leerse como confirmación).
+ *
  * @param string $message Mensaje del usuario.
  * @return bool|null true = confirma, false = rechaza, null = indeterminado.
  */
 function detectUserConfirmation(string $message): ?bool
 {
-    $lower = mb_strtolower(trim($message));
+    $trimmed = trim($message);
+    if ($trimmed === '') {
+        return null;
+    }
+
+    $lower = mb_strtolower($trimmed, 'UTF-8');
+    $normalized = preg_replace('/[¡!¿?.,;:]+/u', ' ', $lower);
+    $normalized = trim(preg_replace('/\s+/', ' ', $normalized));
+
+    if ($normalized === '') {
+        return null;
+    }
+
+    // Respuestas de confirmación/rechazo son cortas por naturaleza. Un mensaje largo
+    // que solo contiene una de estas palabras de casualidad es, en realidad, otra cosa
+    // (una pregunta nueva, un comentario, etc.) y no debe disparar la acción pendiente.
+    $wordCount = count(explode(' ', $normalized));
+    if ($wordCount > 6) {
+        return null;
+    }
 
     $confirmations = [
-        'sí', 'si', 'yes', 'correcto', 'está bien', 'esta bien',
-        'está correcto', 'esta correcto', 'confirmo', 'de acuerdo',
+        'sí', 'si', 'yes', 'correcto', 'esta bien', 'está bien',
+        'esta correcto', 'está correcto', 'confirmo', 'de acuerdo',
         'ok', 'okay', 'perfecto', 'bien', 'vale'
     ];
     $rejections = [
-        'no', 'incorrecto', 'está mal', 'esta mal', 'mal',
+        'no', 'incorrecto', 'esta mal', 'está mal', 'mal',
         'error', 'corregir', 'cambiar'
     ];
 
+    // Coincidencia de palabra/frase completa (con límites de palabra), no substring.
     foreach ($confirmations as $word) {
-        if (mb_strpos($lower, $word) !== false) {
+        if (preg_match('/(?:^|\s)' . preg_quote($word, '/') . '(?:$|\s)/u', $normalized)) {
             return true;
         }
     }
     foreach ($rejections as $word) {
-        if (mb_strpos($lower, $word) !== false) {
+        if (preg_match('/(?:^|\s)' . preg_quote($word, '/') . '(?:$|\s)/u', $normalized)) {
             return false;
         }
     }

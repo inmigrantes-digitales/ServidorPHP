@@ -54,6 +54,18 @@ function sendSSE(string $data): void
     flush();
 }
 
+// ── Limpieza oportunista de sesiones viejas ──
+// No hay cron configurado en este entorno, así que en vez de depender de uno, se
+// dispara con baja probabilidad en cada request (mismo patrón que usa PHP para el
+// garbage collection de sus propias sesiones: session.gc_probability/gc_divisor).
+// Es seguro perder archivos de sesión viejos: los datos permanentes del usuario están
+// en `users`/`cases`, y las conversaciones que sí terminaron en un caso ya quedaron
+// archivadas aparte en `ai_sessions` (ver archiveConversationForCase) antes de que
+// esto las borre.
+if (random_int(1, 100) === 1) {
+    cleanExpiredSessions();
+}
+
 // ── Cargar o crear sesión ──
 $session = getAISession($sessionId);
 
@@ -75,10 +87,29 @@ try {
             saveAISession($sessionId, $session);
             exit;
         } elseif ($confirmation === false) {
-            // Usuario rechazó → continuar recopilando
+            // Usuario rechazó → ofrecer menú de qué corregir directamente desde el
+            // backend (no depender del LLM para esto: como ningún dato se borra solo,
+            // si se deja que la IA "interprete" el rechazo, los campos siguen completos
+            // y el flujo vuelve a caer en confirm_data una y otra vez sin salida).
             $session['awaitingConfirmation'] = false;
+            $result = buildCorrectionMenuResponse($session);
+            addToHistory($session, 'assistant', $result['assistant']['message']);
+            sendSSE('__JSON__START__' . json_encode($result, JSON_UNESCAPED_UNICODE));
+            $session['lastAction'] = 'select_correction';
+            saveAISession($sessionId, $session);
+            exit;
         }
         // null = indeterminado → dejar que el LLM interprete
+    }
+
+    // ── Manejar selección de qué corregir (después de un "no" en confirm_data) ──
+    if (($session['lastAction'] ?? null) === 'select_correction') {
+        $result = handleCorrectionSelection($message, $session);
+        addToHistory($session, 'assistant', $result['assistant']['message']);
+        sendSSE('__JSON__START__' . json_encode($result, JSON_UNESCAPED_UNICODE));
+        $session['lastAction'] = $result['action'] ?? 'select_correction';
+        saveAISession($sessionId, $session);
+        exit;
     }
 
     // ── Construir contexto para el prompt ──
@@ -91,10 +122,17 @@ try {
         'problemTypes' => getProblemTypesForPrompt(),
     ];
 
-    // ── Llamar al LLM con streaming ──
+    // ── Llamar al LLM ──
     // Excluir el último mensaje del historial (es el actual) para no duplicarlo
     $historyForLLM = array_slice($session['history'], 0, -1);
 
+    // Nota: NO se transmiten tokens crudos en vivo al navegador. Este endpoint espera
+    // JSON estructurado (no una charla libre), y el modelo económico usado a veces no
+    // respeta esa instrucción y arranca escribiendo texto suelto. Si ese texto se
+    // muestra en vivo antes de validarlo, el usuario ve una respuesta "fantasma" que
+    // luego se contradice con la respuesta real (una vez validado el JSON, o tras el
+    // reintento). Por eso esperamos la respuesta completa y validada antes de mostrar
+    // nada; solo entonces se envía un único evento SSE con el mensaje final.
     $result = runAgent([
         'userMessage'    => $message,
         'sessionContext' => $promptContext,
@@ -104,24 +142,137 @@ try {
             'name'        => !empty(GROQ_API_KEY) ? 'llama-3.1-8b-instant' : GEMINI_MODEL,
             'temperature' => 0.4,
         ],
-        'stream'  => true,
-        'onToken' => function (string $text) {
-            sendSSE($text);
-        },
+        'stream'  => false,
+        'onToken' => null,
     ]);
 
     $parsed = $result['parsed'];
 
+    // Contexto: en qué dato puntual estamos de la etapa de registro (usuario nuevo).
+    // Se usa para no confundir un teléfono con un DNI (ambos son 7-10 dígitos) y para
+    // rescatar el nombre cuando el modelo no lo extrae correctamente.
+    $regUserData = $session['userData'] ?? [];
+    $awaitingNombreForRegistration = !empty($session['userLookupDone'])
+        && empty($session['dbUser'])
+        && empty($regUserData['nombre']);
+    $awaitingPhoneForRegistration = !empty($session['userLookupDone'])
+        && empty($session['dbUser'])
+        && !empty($regUserData['nombre'])
+        && empty($regUserData['telefono']);
+
     // Fallback defensivo: si el modelo no colocó DNI en data.update pero el usuario lo escribió,
     // extraerlo del mensaje para no perder el disparo de check_user.
     // Aceptamos 7-10 dígitos para capturar entradas mal formateadas y validarlas luego.
-    if (empty($parsed['data']['update']['dni']) && preg_match('/\b(\d{7,10})\b/', $message, $dniMatch)) {
+    // No aplica si en este paso puntual se está esperando un teléfono: también son
+    // 7-10 dígitos y NO es un DNI nuevo, es la respuesta a "¿su teléfono?".
+    if (
+        !$awaitingPhoneForRegistration
+        && empty($parsed['data']['update']['dni'])
+        && preg_match('/\b(\d{7,10})\b/', $message, $dniMatch)
+    ) {
         $parsed['data']['update']['dni'] = $dniMatch[1];
     }
 
-    // Si estamos en alta de usuario y no hay center_id explícito,
-    // intentar resolver el centro desde el mensaje (nombre/zona/id).
-    if (!empty($session['userLookupDone']) && empty($session['dbUser']) && empty($parsed['data']['update']['center_id'])) {
+    // Fallback simétrico: si estamos esperando el teléfono y el modelo no lo extrajo,
+    // tomarlo directamente del mensaje cuando tiene forma de teléfono.
+    if ($awaitingPhoneForRegistration && empty($parsed['data']['update']['telefono'])) {
+        $phoneDigits = preg_replace('/\D/', '', $message);
+        if (strlen($phoneDigits) >= 8) {
+            $parsed['data']['update']['telefono'] = $phoneDigits;
+        }
+    }
+
+    // Fallback defensivo para el nombre: el modelo a veces no logra extraerlo de un
+    // mensaje simple como "Pedro Flores". Si estamos esperando el nombre y el mensaje
+    // parece plausiblemente un nombre (solo letras/espacios, 2+ palabras), usarlo tal
+    // cual — sacando antes frases de introducción comunes ("mi nombre es...", "me
+    // llamo...", "soy...") para no guardar la frase entera como si fuera el nombre.
+    if ($awaitingNombreForRegistration && empty($parsed['data']['update']['nombre'])) {
+        $trimmedMsg = trim((string)preg_replace(
+            '/^(mi\s+nombre\s+es|me\s+llamo|yo\s+soy|soy)\s+/ui',
+            '',
+            trim($message)
+        ));
+        $wordCount = $trimmedMsg === '' ? 0 : count(array_filter(preg_split('/\s+/u', $trimmedMsg)));
+        if (
+            $trimmedMsg !== ''
+            && mb_strlen($trimmedMsg, 'UTF-8') <= 80
+            && $wordCount >= 2
+            && preg_match('/^[\p{L}\s.\'-]+$/u', $trimmedMsg)
+        ) {
+            $parsed['data']['update']['nombre'] = $trimmedMsg;
+        }
+    }
+
+    // Fallback defensivo para la descripción del problema: el modelo a veces no logra
+    // extraerla de un mensaje libre (igual que pasaba con nombre/teléfono). Si el turno
+    // anterior fue justamente "ask_problem" (le acabamos de preguntar cuál es su problema)
+    // y todavía no hay descripción, usar el mensaje tal cual si es lo bastante largo
+    // para ser una descripción real.
+    // OJO: no aplica si el mensaje en realidad es una consulta de estado ("¿cómo va mi
+    // caso?", "quería saber el estado de mi caso") — eso no es la descripción de un
+    // caso nuevo, es otra intención (detectConversationIntent la va a redirigir a
+    // check_case_status más abajo). Guardarlo como descripción acá lo dejaría pegado
+    // en la sesión y reaparecería más adelante como si fuera un caso nuevo real.
+    if (
+        ($session['lastAction'] ?? null) === 'ask_problem'
+        && empty($session['problemData']['descripcion'] ?? null)
+        && empty($parsed['data']['update']['descripcion'])
+        && detectConversationIntent($message) !== 'check_case_status'
+    ) {
+        $trimmedProblem = trim($message);
+        if (mb_strlen($trimmedProblem, 'UTF-8') >= 10) {
+            $parsed['data']['update']['descripcion'] = $trimmedProblem;
+        }
+    }
+
+    // ── Detectar cambio de identidad ──
+    // Una vez identificado un usuario en la sesión, el resto del flujo evita volver a
+    // pedir DNI o repetir el registro (a propósito, para no ser repetitivo). Pero eso
+    // significa que si esta persona en realidad NO es quien ya se identificó (dispositivo
+    // compartido, se equivocó de conversación, etc.), el sistema seguía arrastrando el
+    // nombre/DNI/caso de la persona anterior indefinidamente. Si llega un DNI distinto al
+    // ya verificado, o el usuario dice explícitamente que no es esa persona, se resetea la
+    // identificación para volver a verificar desde cero.
+    $newDniClean = !empty($parsed['data']['update']['dni'])
+        ? preg_replace('/\D/', '', (string)$parsed['data']['update']['dni'])
+        : null;
+    $storedDniClean = !empty($session['userData']['dni'])
+        ? preg_replace('/\D/', '', (string)$session['userData']['dni'])
+        : null;
+
+    $dniChanged = !empty($session['userLookupDone'])
+        && !$awaitingPhoneForRegistration
+        && $newDniClean
+        && $storedDniClean
+        && $newDniClean !== $storedDniClean;
+
+    if ($dniChanged || detectIdentityMismatchIntent($message)) {
+        $session['userData'] = $newDniClean ? ['dni' => $newDniClean] : [];
+        $session['dbUser'] = null;
+        $session['userLookupDone'] = false;
+        $session['problemData'] = [];
+        $session['awaitingConfirmation'] = false;
+
+        if ($newDniClean) {
+            // Ya tenemos un DNI nuevo: dejar que el flujo normal lo verifique ahora mismo.
+            $parsed['data']['update'] = ['dni' => $newDniClean];
+        } else {
+            // Dijo que no es esa persona pero todavía no dio un DNI nuevo.
+            $parsed['assistant']['message'] = 'Disculpe la confusión. ¿Podría indicarme su número de DNI, por favor?';
+            $parsed['action'] = 'ask_dni';
+            $parsed['data']['update'] = [];
+        }
+    }
+
+    // Solo interpretar el mensaje como selección de centro cuando el turno anterior
+    // fue justamente la pregunta de centro (ask_location). Aplica tanto a usuarios
+    // nuevos como existentes, ya que el centro se pide para cada caso.
+    // Evita falsos positivos con números sueltos (DNI, teléfono, edad, etc.) en otros pasos.
+    if (
+        empty($parsed['data']['update']['center_id'])
+        && ($session['lastAction'] ?? null) === 'ask_location'
+    ) {
         $centerFromText = inferCenterSelectionFromMessage($message, $parsed['data']['update'] ?? []);
         if (!empty($centerFromText)) {
             $parsed['data']['update'] = array_merge($parsed['data']['update'] ?? [], $centerFromText);
@@ -145,8 +296,41 @@ try {
     }
 
     $action = reconcileActionWithSession($action, $session, $parsed);
+
+    // Si el paso avanzó respecto al turno anterior (ej: ya se capturó el teléfono y
+    // ahora corresponde pedir el centro), SIEMPRE se usa un mensaje propio y
+    // garantizadamente coherente con la acción final — sin importar si el LLM había
+    // propuesto esa misma acción o no. No alcanza con comparar "¿el backend tuvo que
+    // corregir la acción?", porque el LLM puede proponer la acción correcta (ej.
+    // ask_location) y aun así escribir un texto que quedó pensado para la pregunta
+    // anterior (ej. seguir hablando del teléfono) — son dos campos del mismo JSON que
+    // el modelo no siempre mantiene consistentes entre sí.
+    //
+    // Si en cambio seguimos en EL MISMO paso que el turno anterior (ej: seguimos
+    // esperando el nombre), confiamos en el texto del LLM — esto es lo que permite que
+    // responda de forma conversacional a una repregunta del usuario ("¿para qué me
+    // registrás?") y retome el pedido del dato pendiente con sus propias palabras, en
+    // vez de repetir siempre el mismo texto enlatado como si no hubiera escuchado nada.
+    //
+    // "register_user"/"update_user_data" piden en realidad DOS datos distintos
+    // (nombre y luego teléfono) bajo la misma acción, así que comparar solo el nombre
+    // de la acción no alcanza: hay que comparar también CUÁL de los dos falta, para
+    // no confundir "seguimos pidiendo el nombre" con "ya se capturó el nombre y ahora
+    // pedimos el teléfono" (este turno sí avanzó, aunque la acción siga diciendo lo mismo).
+    $beforeSignature = stepSignature($session['lastAction'] ?? 'ask_dni', $regUserData, $session['dbUser'] ?? null);
+    $afterSignature = stepSignature($action, $session['userData'] ?? [], $session['dbUser'] ?? null);
+    $stayedOnSameStep = $afterSignature === $beforeSignature;
+
+    if (!$stayedOnSameStep) {
+        $parsed['assistant']['message'] = buildFallbackMessageForAction($action, $session);
+    }
+
     $parsed['action'] = $action;
     $parsed = handleAction($action, $parsed, $session, $sessionId, $message);
+
+    // handleAction (p.ej. handleCheckUser) puede reetiquetar la acción final;
+    // usar esa versión para que lastAction refleje lo que realmente vio el usuario.
+    $action = $parsed['action'] ?? $action;
 
     // ── Guardar estado ──
     $session['lastAction'] = $action;
@@ -301,17 +485,21 @@ function handleCheckUser(array $parsed, array &$session): array
     $dbUser = findUserByDni($dniClean);
 
     if ($dbUser) {
-        // Usuario encontrado
+        // Usuario encontrado. Primero hay que saber PARA QUÉ escribe (puede ser solo
+        // una consulta de estado, una pregunta, etc.) — recién si de verdad quiere
+        // cargar un caso nuevo tiene sentido preguntarle el centro (ver
+        // reconcileActionWithSession y chooseCreateFlowAction, que piden la
+        // descripción antes que el centro para un usuario ya existente).
         $session['dbUser'] = $dbUser;
-        $parsed['assistant']['message'] = "¡Bienvenido/a de nuevo, {$dbUser['name']}! ¿En qué puedo ayudarle hoy? Cuénteme su problema o consulta.";
-        $parsed['action'] = 'ask_problem';
         $parsed['data']['update']['dni'] = $dniClean;
         $parsed['data']['update']['nombre'] = $dbUser['name'];
+        $parsed['assistant']['message'] = "¡Bienvenido/a de nuevo, {$dbUser['name']}! ¿En qué puedo ayudarle hoy?";
+        $parsed['action'] = 'ask_problem';
     } else {
         // Usuario no encontrado
         $session['dbUser'] = null;
-        $parsed['assistant']['message'] = 'Vamos a registrarlo. ¿Podría decirme su nombre completo (nombre y apellido )?';
-        $parsed['action'] = 'ask_location';
+        $parsed['assistant']['message'] = 'Vamos a registrarlo. ¿Podría decirme su nombre completo (nombre y apellido)?';
+        $parsed['action'] = 'register_user';
         $parsed['validation']['missing_fields'] = ['nombre', 'telefono', 'center_id'];
     }
 
@@ -339,10 +527,32 @@ function reconcileActionWithSession(string $action, array $session, array $parse
     }
 
     if ($action === 'ask_location') {
+        // Usuario nuevo: solo confiar en ask_location si ya completó nombre + telefono.
+        // Evita saltar al pedido de centro antes de tiempo si el LLM se adelanta.
+        if ($lookupDone && empty($dbUser) && (!$hasNombre || !$hasTelefono)) {
+            return 'register_user';
+        }
+        // Usuario existente: el centro recién se pregunta una vez que sabemos que
+        // quiere cargar un caso nuevo (ya hay una descripción). Si todavía no la
+        // hay, no hay que adelantarse a pedir el centro sin saber para qué escribió.
+        if (!empty($dbUser) && !$hasDescripcion) {
+            return 'ask_problem';
+        }
+        // Si ya se eligió centro para este caso, no repetir el paso.
+        if ($hasCenter) {
+            if (!$hasDescripcion) {
+                return 'ask_problem';
+            }
+            return 'confirm_data';
+        }
         return $action;
     }
 
     // Si ya se verificó DNI y no se encontró usuario, NO volver a pedir DNI.
+    // Usuario NUEVO en alta: primero nombre+telefono+centro (parte de su registro),
+    // recién después el problema. Una vez completo todo, siempre pasar a confirmar,
+    // sin importar qué acción stale siga proponiendo el LLM (si insiste en "ask_problem"
+    // por confusión, no hay que quedarse trabado repitiendo la pregunta para siempre).
     if ($lookupDone && empty($dbUser)) {
         if (!$hasNombre || !$hasTelefono) {
             return 'register_user';
@@ -353,19 +563,21 @@ function reconcileActionWithSession(string $action, array $session, array $parse
         if (!$hasDescripcion) {
             return 'ask_problem';
         }
-        if ($action === 'ask_dni' || $action === 'check_user') {
-            return 'confirm_data';
-        }
+        return 'confirm_data';
     }
 
-    // Si ya hay usuario encontrado, no tiene sentido pedir registro ni DNI.
+    // Usuario YA EXISTENTE: primero hay que saber en qué se lo puede ayudar (puede ser
+    // solo una consulta de estado, una pregunta, etc. — no siempre implica cargar un
+    // caso nuevo). Solo una vez que hay una descripción (o sea, sí quiere cargar un
+    // caso) tiene sentido preguntarle el centro para ESE caso puntual.
     if (!empty($dbUser)) {
         if (!$hasDescripcion) {
             return 'ask_problem';
         }
-        if (in_array($action, ['ask_dni', 'check_user', 'register_user', 'update_user_data', 'ask_location'], true)) {
-            return 'confirm_data';
+        if (!$hasCenter) {
+            return 'ask_location';
         }
+        return 'confirm_data';
     }
 
     // Si tenemos DNI y nunca se verificó, forzar check_user sin depender del texto del LLM.
@@ -421,6 +633,38 @@ function detectConversationIntent(string $userMessage): ?string
 }
 
 /**
+ * Detecta si el usuario está diciendo explícitamente que NO es la persona con la
+ * que la sesión cree estar hablando (dispositivo compartido, confusión, etc.).
+ */
+function detectIdentityMismatchIntent(string $userMessage): bool
+{
+    $msg = mb_strtolower(trim($userMessage), 'UTF-8');
+    if ($msg === '') {
+        return false;
+    }
+
+    $patterns = [
+        '/\bno soy\b/ui',
+        '/\bsoy otra persona\b/ui',
+        '/\bme equivoqu/ui',
+        '/\bno me llamo\b/ui',
+        '/\bese no soy yo\b/ui',
+        '/\besa no soy yo\b/ui',
+        '/\bno es mi nombre\b/ui',
+        '/\bno es mi dni\b/ui',
+        '/\bcambiar de usuario\b/ui',
+    ];
+
+    foreach ($patterns as $pattern) {
+        if (preg_match($pattern, $msg) === 1) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
  * Selecciona una acción segura para el flujo de carga de caso.
  */
 function chooseCreateFlowAction(array $session): string
@@ -457,8 +701,14 @@ function chooseCreateFlowAction(array $session): string
         return 'confirm_data';
     }
 
+    // Usuario existente: primero la descripción del problema, y solo si sí va a
+    // cargar un caso (ya hay descripción) se pide el centro para ese caso.
     if (!$hasDescripcion) {
         return 'ask_problem';
+    }
+
+    if (!$hasCenter) {
+        return 'ask_location';
     }
 
     return 'confirm_data';
@@ -483,24 +733,26 @@ function extractRequestedCaseId(string $userMessage): ?int
  */
 function handleAskLocation(array $parsed, array $session): array
 {
-    $centers = getCentersForPrompt();
-    $options = formatCentersOptionsForPrompt($centers);
-
     $baseMessage = trim((string)($parsed['assistant']['message'] ?? ''));
     if ($baseMessage === '') {
         $baseMessage = 'Por favor, indíqueme qué centro de Acceso Senior le queda más cerca.';
     }
-
-    $parsed['assistant']['message'] = $baseMessage
-        /* . "\n\nOpciones disponibles:\n"
-        . $options
-        . "\n\nPuede responder con el número de opción o con el nombre del centro." */;
+    $parsed['assistant']['message'] = $baseMessage;
 
     $parsed['validation']['missing_fields'] = array_values(array_unique(array_merge(
         $parsed['validation']['missing_fields'] ?? [],
         ['center_id']
     )));
 
+    return attachCenterOptions($parsed);
+}
+
+/**
+ * Adjunta el catálogo de centros como opciones seleccionables (botones en el frontend).
+ */
+function attachCenterOptions(array $parsed): array
+{
+    $centers = getCentersForPrompt();
     $parsed['data']['summary']['center_options'] = array_map(static function (array $c): array {
         return [
             'id' => $c['id'],
@@ -510,6 +762,36 @@ function handleAskLocation(array $parsed, array $session): array
     }, $centers);
 
     return $parsed;
+}
+
+/**
+ * Normaliza texto para comparaciones tolerantes a acentos/mayúsculas
+ * (minúsculas, sin tildes, solo alfanumérico y espacios simples).
+ *
+ * OJO: no usar iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', ...) para esto — en este
+ * entorno (Windows) la transliteración de vocales acentuadas inserta un apóstrofo
+ * en vez de solo sacar la tilde (p.ej. "teléfono" -> "tel'efono"), lo que rompe la
+ * palabra en dos al filtrar caracteres no alfanuméricos después. Se reemplazan las
+ * tildes a mano para que el resultado sea predecible sin importar la plataforma.
+ */
+function normalizeForMatch(?string $value): string
+{
+    $value = trim((string)$value);
+    if ($value === '') {
+        return '';
+    }
+    $value = mb_strtolower($value, 'UTF-8');
+    $value = strtr($value, [
+        'á' => 'a', 'à' => 'a', 'ä' => 'a', 'â' => 'a',
+        'é' => 'e', 'è' => 'e', 'ë' => 'e', 'ê' => 'e',
+        'í' => 'i', 'ì' => 'i', 'ï' => 'i', 'î' => 'i',
+        'ó' => 'o', 'ò' => 'o', 'ö' => 'o', 'ô' => 'o',
+        'ú' => 'u', 'ù' => 'u', 'ü' => 'u', 'û' => 'u',
+        'ñ' => 'n',
+    ]);
+    $value = preg_replace('/[^a-z0-9\s]/', ' ', $value);
+    $value = preg_replace('/\s+/', ' ', $value);
+    return trim($value);
 }
 
 /**
@@ -538,20 +820,8 @@ function inferCenterSelectionFromMessage(string $message, array $update): ?array
         }
     }
 
-    $normalize = static function (?string $value): string {
-        $value = trim((string)$value);
-        if ($value === '') {
-            return '';
-        }
-        $value = mb_strtolower($value, 'UTF-8');
-        $value = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value) ?: $value;
-        $value = preg_replace('/[^a-z0-9\s]/', ' ', $value);
-        $value = preg_replace('/\s+/', ' ', $value);
-        return trim($value);
-    };
-
-    $messageNorm = $normalize($message);
-    $centerNameNorm = $normalize($update['center_name'] ?? '');
+    $messageNorm = normalizeForMatch($message);
+    $centerNameNorm = normalizeForMatch($update['center_name'] ?? '');
 
     if (preg_match('/\b(?:opcion|opción|centro|id)?\s*(\d{1,4})\b/ui', $message, $m)) {
         $candidateId = (int)$m[1];
@@ -565,8 +835,8 @@ function inferCenterSelectionFromMessage(string $message, array $update): ?array
     }
 
     foreach ($centers as $center) {
-        $nameNorm = $normalize($center['name'] ?? '');
-        $zoneNorm = $normalize($center['zone'] ?? '');
+        $nameNorm = normalizeForMatch($center['name'] ?? '');
+        $zoneNorm = normalizeForMatch($center['zone'] ?? '');
 
         if ($centerNameNorm !== '' && ($centerNameNorm === $nameNorm || str_contains($nameNorm, $centerNameNorm))) {
             return [
@@ -594,25 +864,6 @@ function inferCenterSelectionFromMessage(string $message, array $update): ?array
     }
 
     return null;
-}
-
-/**
- * Formatea el listado de centros para mostrar en el chat.
- */
-function formatCentersOptionsForPrompt(array $centers): string
-{
-    if (empty($centers)) {
-        return '- No hay centros disponibles en este momento.';
-    }
-
-    $lines = [];
-    foreach ($centers as $center) {
-        $zone = trim((string)($center['zone'] ?? ''));
-        $zoneText = $zone !== '' ? " - zona {$zone}" : '';
-        $lines[] = '- [' . (int)$center['id'] . '] ' . $center['name'] . $zoneText;
-    }
-
-    return implode("\n", $lines);
 }
 
 /**
@@ -682,29 +933,35 @@ function handleCreateTicket(array $parsed, array &$session, string $sessionId): 
     $descripcion = $problemData['descripcion'] ?? $parsed['data']['update']['descripcion'] ?? null;
     $categoria   = $problemData['categoria'] ?? $parsed['data']['update']['categoria'] ?? null;
     $problemTypeId = resolveProblemTypeId($categoria, $descripcion);
-    $location = $session['location'] ?? null;
 
     try {
         if ($dbUser && !empty($dbUser['id'])) {
-            // Usuario existente → solo crear caso
-            $caseResult = saveExistingUserCase((int)$dbUser['id'], $descripcion, $problemTypeId, $location, $sessionId);
+            // Usuario existente → solo crear caso, con el centro elegido para este caso
+            $preferredCenterId = !empty($userData['center_id']) ? (int)$userData['center_id'] : null;
+            $preferredCenterName = $userData['center_name'] ?? null;
+            $caseResult = saveExistingUserCase((int)$dbUser['id'], $descripcion, $problemTypeId, $sessionId, $preferredCenterId, $preferredCenterName);
             $caseId = (int)$caseResult['caseId'];
-            $nombre = $dbUser['name'] ?? 'estimado/a';
+            $nombre = $dbUser['name'] ?? $userData['nombre'] ?? 'estimado/a';
+            $dni = $dbUser['dni'] ?? $userData['dni'] ?? null;
         } else {
             // Usuario nuevo → crear usuario + caso
-            $result = saveNewUserAndCase($userData, $descripcion, $problemTypeId, $location, $sessionId);
+            $result = saveNewUserAndCase($userData, $descripcion, $problemTypeId, $sessionId);
             $caseId = (int)$result['caseId'];
             $session['dbUser'] = ['id' => $result['userId']];
             $nombre = $userData['nombre'] ?? 'estimado/a';
+            $dni = $userData['dni'] ?? null;
             $caseResult = $result;
         }
 
         $centerName = $caseResult['centerName'] ?? null;
         $centerText = $centerName ? " Se asignó al centro {$centerName}." : '';
 
+        archiveConversationForCase($caseId, $sessionId, $session);
+        resetCaseSpecificSessionData($session);
+
         $parsed['assistant']['message'] = "¡Listo, {$nombre}! Su consulta ha sido registrada exitosamente (N° {$caseId})."
             . $centerText
-            . " En breve, un facilitador se pondrá en contacto con usted para ayudarlo."
+            . " En breve, un facilitador se pondrá en contacto con usted para ayudarle."
             . " ¡Que tenga un excelente día!";
         $parsed['action'] = 'finish';
         $parsed['process']['suggest_finish'] = true;
@@ -713,7 +970,10 @@ function handleCreateTicket(array $parsed, array &$session, string $sessionId): 
             'center_assigned' => [
                 'id' => $caseResult['centerId'] ?? null,
                 'name' => $centerName,
-                'distance_km' => $caseResult['centerDistanceKm'] ?? null,
+            ],
+            'consultante' => [
+                'dni' => $dni,
+                'nombre' => $nombre,
             ],
         ];
 
@@ -738,22 +998,28 @@ function executeConfirmedAction(array &$session, string $sessionId): array
     $categoria   = $problemData['categoria'] ?? null;
     $problemTypeId = resolveProblemTypeId($categoria, $descripcion);
     $dbUser      = $session['dbUser'] ?? null;
-    $location    = $session['location'] ?? null;
 
     try {
         if ($dbUser && !empty($dbUser['id'])) {
-            $caseResult = saveExistingUserCase((int)$dbUser['id'], $descripcion, $problemTypeId, $location, $sessionId);
+            $preferredCenterId = !empty($userData['center_id']) ? (int)$userData['center_id'] : null;
+            $preferredCenterName = $userData['center_name'] ?? null;
+            $caseResult = saveExistingUserCase((int)$dbUser['id'], $descripcion, $problemTypeId, $sessionId, $preferredCenterId, $preferredCenterName);
             $caseId = (int)$caseResult['caseId'];
             $nombre = $dbUser['name'] ?? $userData['nombre'] ?? 'estimado/a';
+            $dni = $dbUser['dni'] ?? $userData['dni'] ?? null;
         } else {
-            $result = saveNewUserAndCase($userData, $descripcion, $problemTypeId, $location, $sessionId);
+            $result = saveNewUserAndCase($userData, $descripcion, $problemTypeId, $sessionId);
             $caseId = (int)$result['caseId'];
             $session['dbUser'] = ['id' => $result['userId']];
             $nombre = $userData['nombre'] ?? 'estimado/a';
+            $dni = $userData['dni'] ?? null;
             $caseResult = $result;
         }
 
-        return buildFinalResponse($nombre, $caseId, $caseResult['centerName'] ?? null, $caseResult['centerId'] ?? null, $caseResult['centerDistanceKm'] ?? null);
+        archiveConversationForCase($caseId, $sessionId, $session);
+        resetCaseSpecificSessionData($session);
+
+        return buildFinalResponse($nombre, $caseId, $caseResult['centerName'] ?? null, $caseResult['centerId'] ?? null, $dni);
 
     } catch (Exception $e) {
         error_log("[{$sessionId}] Error en confirmación: " . $e->getMessage());
@@ -790,6 +1056,239 @@ function mergeSessionData(array &$session, array $update): void
 }
 
 /**
+ * Identifica con precisión "qué dato puntual se está pidiendo" para una acción dada.
+ * Para la mayoría de las acciones alcanza con el nombre de la acción (cada una pide
+ * un solo dato), pero "register_user"/"update_user_data" en la práctica piden DOS
+ * datos distintos en secuencia (nombre, luego teléfono), así que ahí se distingue
+ * cuál de los dos falta todavía.
+ */
+function stepSignature(string $action, array $userData, ?array $dbUser): string
+{
+    if (in_array($action, ['register_user', 'update_user_data'], true) && empty($dbUser)) {
+        if (empty($userData['nombre'])) {
+            return 'register_user:nombre';
+        }
+        if (empty($userData['telefono'])) {
+            return 'register_user:telefono';
+        }
+        return 'register_user:done';
+    }
+
+    return $action;
+}
+
+/**
+ * Genera un mensaje propio y consistente para una acción que el backend forzó
+ * (distinta a la que había propuesto el LLM). El texto del LLM quedó pensado para
+ * su acción original y ya no corresponde al paso real del flujo, así que se
+ * reemplaza en vez de mostrarlo mezclado con la acción correcta.
+ */
+function buildFallbackMessageForAction(string $action, array $session): string
+{
+    $userData = $session['userData'] ?? [];
+    $problemData = $session['problemData'] ?? [];
+    $nombre = $userData['nombre'] ?? null;
+
+    switch ($action) {
+        case 'ask_dni':
+            return 'Por favor, indíqueme su número de DNI (sin puntos ni espacios).';
+
+        case 'register_user':
+        case 'update_user_data':
+            if (empty($userData['nombre'])) {
+                return 'Vamos a registrarlo. ¿Podría decirme su nombre completo (nombre y apellido)?';
+            }
+            if (empty($userData['telefono'])) {
+                return "Gracias, {$nombre}. ¿Podría indicarme un teléfono de contacto?";
+            }
+            return "Gracias, {$nombre}. ¿Podría confirmarme sus datos?";
+
+        case 'ask_location':
+            return $nombre
+                ? "¿En qué centro de Acceso Senior le gustaría ser atendido, {$nombre}?"
+                : '¿En qué centro de Acceso Senior le gustaría ser atendido?';
+
+        case 'ask_problem':
+            return $nombre
+                ? "Cuénteme, {$nombre}: ¿cuál es el problema o consulta que necesita resolver?"
+                : '¿Cuál es el problema o consulta que necesita resolver?';
+
+        case 'confirm_data':
+            // Redactado como una frase natural (no una lista de campo: valor), para
+            // que se sienta como alguien repasando los datos en voz alta, no como
+            // un formulario. Cada parte se arma solo si el dato existe (para un
+            // usuario ya existente, por ejemplo, puede no haber teléfono porque no
+            // se le vuelve a pedir el que ya tiene registrado).
+            $confirmParts = [];
+            if (!empty($userData['dni'])) {
+                $confirmParts[] = "su DNI es {$userData['dni']}";
+            }
+            if (!empty($userData['telefono'])) {
+                $confirmParts[] = "el teléfono de contacto es {$userData['telefono']}";
+            }
+            if (!empty($userData['center_name'])) {
+                $confirmParts[] = "lo vamos a atender en el centro {$userData['center_name']}";
+            }
+
+            $msg = $nombre ? "Muy bien, {$nombre}, ya tengo todo lo que necesito." : 'Muy bien, ya tengo todo lo que necesito.';
+            if ($confirmParts) {
+                $msg .= ' Le confirmo: ' . implode(', ', $confirmParts) . '.';
+            }
+            if (!empty($problemData['descripcion'])) {
+                $msg .= " Me contó que necesita ayuda con esto: \"{$problemData['descripcion']}\".";
+            }
+            $msg .= ' ¿Está todo correcto?';
+            return $msg;
+
+        default:
+            return $nombre
+                ? "Continuemos, {$nombre}: ¿podría darme más detalles, por favor?"
+                : '¿Podría darme más detalles, por favor?';
+    }
+}
+
+/**
+ * Arma la respuesta cuando el usuario rechaza el resumen de confirm_data, ofreciendo
+ * botones con los datos que se pueden corregir. Para un usuario ya existente en el
+ * sistema no se ofrece corregir nombre/teléfono (son de su cuenta, no de este caso).
+ */
+function buildCorrectionMenuResponse(array $session): array
+{
+    $dbUser = $session['dbUser'] ?? null;
+
+    $response = buildFallbackResponse('Sin problema. ¿Qué dato le gustaría corregir?');
+    $response['action'] = 'select_correction';
+
+    $options = [];
+    if (empty($dbUser)) {
+        $options[] = ['value' => 'nombre', 'label' => 'Nombre completo'];
+        $options[] = ['value' => 'telefono', 'label' => 'Teléfono'];
+    }
+    $options[] = ['value' => 'center', 'label' => 'Centro'];
+    $options[] = ['value' => 'descripcion', 'label' => 'Descripción del problema'];
+    $options[] = ['value' => 'cancelar', 'label' => 'Cancelar, no quiero cargar un caso'];
+
+    $response['data']['summary'] = ['correction_options' => $options];
+
+    return $response;
+}
+
+/**
+ * Interpreta la elección del usuario sobre qué dato corregir (viene del menú de
+ * buildCorrectionMenuResponse) y limpia ese campo puntual en la sesión para que el
+ * flujo normal (los mismos pasos de siempre) lo vuelva a pedir.
+ */
+function handleCorrectionSelection(string $message, array &$session): array
+{
+    $msgNorm = normalizeForMatch($message);
+    $dbUser = $session['dbUser'] ?? null;
+
+    if (str_contains($msgNorm, 'cancelar')) {
+        // El usuario no quiere seguir cargando este caso. Se descarta todo lo propio
+        // del caso (centro elegido + descripción) — nada de esto llegó a guardarse en
+        // la base de datos todavía (solo se escribe al confirmar), así que "cancelar"
+        // acá significa simplemente no volver a preguntar por estos datos y quedar
+        // disponible para lo que necesite a continuación. Los datos de identidad ya
+        // dados (dni, nombre, teléfono) se conservan para no pedirlos de nuevo.
+        resetCaseSpecificSessionData($session);
+        $response = buildFallbackResponse('Entendido, no se cargará ningún caso. ¿En qué más puedo ayudarle?');
+        $response['action'] = 'ask_problem';
+        return $response;
+    }
+
+    if (str_contains($msgNorm, 'centro')) {
+        unset($session['userData']['center_id'], $session['userData']['center_name'], $session['userData']['zone']);
+        $response = buildFallbackResponse(buildFallbackMessageForAction('ask_location', $session));
+        $response['action'] = 'ask_location';
+        return attachCenterOptions($response);
+    }
+
+    if (str_contains($msgNorm, 'descripcion') || str_contains($msgNorm, 'problema')) {
+        $session['problemData'] = [];
+        $response = buildFallbackResponse(buildFallbackMessageForAction('ask_problem', $session));
+        $response['action'] = 'ask_problem';
+        return $response;
+    }
+
+    if (empty($dbUser) && str_contains($msgNorm, 'nombre')) {
+        unset($session['userData']['nombre']);
+        $response = buildFallbackResponse('Vamos a corregirlo. ¿Cuál es su nombre completo (nombre y apellido)?');
+        $response['action'] = 'register_user';
+        return $response;
+    }
+
+    if (empty($dbUser) && str_contains($msgNorm, 'telefono')) {
+        unset($session['userData']['telefono']);
+        $response = buildFallbackResponse('¿Cuál es el teléfono correcto?');
+        $response['action'] = 'register_user';
+        return $response;
+    }
+
+    // No matcheó ninguna opción válida (o pidió corregir algo no editable por acá):
+    // repetir el menú.
+    $response = buildCorrectionMenuResponse($session);
+    $response['assistant']['message'] = 'No entendí bien cuál corregir. Por favor, elija una opción:';
+    return $response;
+}
+
+/**
+ * Guarda una copia permanente de la conversación en la tabla `ai_sessions` de la
+ * base de datos cuando un caso se crea con éxito. Es independiente del archivo de
+ * sesión en storage/ai_sessions/ (que se borra por antigüedad más adelante, haya
+ * tenido éxito o no) — así las conversaciones que sí terminaron en un caso quedan
+ * a salvo en la base antes de que el archivo temporal desaparezca.
+ *
+ * Se guarda con un id derivado de sessionId + caseId (no el sessionId solo) porque
+ * una misma conversación puede crear más de un caso (ver resetCaseSpecificSessionData
+ * más abajo), y cada uno debe conservar su propia copia sin pisar la anterior.
+ *
+ * Si falla (problema de conexión, etc.) no debe interrumpir la creación del caso, que
+ * ya se guardó correctamente en `cases` — solo se registra el error.
+ */
+function archiveConversationForCase(int $caseId, string $sessionId, array $session): void
+{
+    try {
+        $pdo = getDB();
+        $archiveId = substr($sessionId . '_case' . $caseId, 0, 100);
+
+        $payload = json_encode([
+            'case_id'     => $caseId,
+            'session_id'  => $sessionId,
+            'history'     => $session['history'] ?? [],
+            'userData'    => $session['userData'] ?? [],
+            'problemData' => $session['problemData'] ?? [],
+            'dbUser'      => $session['dbUser'] ?? null,
+        ], JSON_UNESCAPED_UNICODE);
+
+        $stmt = $pdo->prepare(
+            'INSERT INTO ai_sessions (id, data, created_at, updated_at)
+             VALUES (?, ?, NOW(), NOW())
+             ON DUPLICATE KEY UPDATE data = VALUES(data), updated_at = NOW()'
+        );
+        $stmt->execute([$archiveId, $payload]);
+    } catch (Exception $e) {
+        error_log("[{$sessionId}] No se pudo archivar la conversación del caso {$caseId}: " . $e->getMessage());
+    }
+}
+
+/**
+ * Limpia los datos propios del caso (centro elegido y descripción del problema)
+ * después de crear un ticket, para que si el usuario carga otro caso en la misma
+ * sesión de chat se le vuelva a preguntar el centro (puede querer uno distinto)
+ * y el problema, en vez de reutilizar silenciosamente los del caso anterior.
+ * Los datos de identidad (dni, nombre, telefono, email) se conservan.
+ */
+function resetCaseSpecificSessionData(array &$session): void
+{
+    unset(
+        $session['userData']['center_id'],
+        $session['userData']['center_name'],
+        $session['userData']['zone']
+    );
+    $session['problemData'] = [];
+}
+
+/**
  * Construye un resumen de datos para confirmación.
  */
 function buildDataSummary(array $session): array
@@ -804,13 +1303,13 @@ function buildDataSummary(array $session): array
 /**
  * Construye la respuesta final exitosa.
  */
-function buildFinalResponse(string $nombre, int $caseId, ?string $centerName = null, ?int $centerId = null, ?float $centerDistanceKm = null): array
+function buildFinalResponse(string $nombre, int $caseId, ?string $centerName = null, ?int $centerId = null, ?string $dni = null): array
 {
     $centerText = $centerName ? " Se asignó al centro {$centerName}." : '';
     $response = buildFallbackResponse(
         "¡Listo, {$nombre}! Su consulta ha sido registrada exitosamente (N° {$caseId})."
         . $centerText
-        . " En breve, un facilitador se pondrá en contacto con usted para ayudarlo. "
+        . " En breve, un facilitador se pondrá en contacto con usted para ayudarle. "
         . "¡Que tenga un excelente día!"
     );
     $response['action'] = 'finish';
@@ -820,7 +1319,10 @@ function buildFinalResponse(string $nombre, int $caseId, ?string $centerName = n
         'center_assigned' => [
             'id' => $centerId,
             'name' => $centerName,
-            'distance_km' => $centerDistanceKm,
+        ],
+        'consultante' => [
+            'dni' => $dni,
+            'nombre' => $nombre,
         ],
     ];
     return $response;
@@ -846,31 +1348,30 @@ function findUserByDni(string $dniClean): ?array
 
 /**
  * Crea un caso para un usuario existente.
+ * El centro se resuelve priorizando la elección hecha para ESTE caso
+ * (preferredCenterId/Name), ya que un mismo usuario puede elegir centros
+ * distintos entre un caso y otro. No se sobreescribe el centro "de perfil"
+ * del usuario (users.center_id): eso solo aplica en el alta inicial.
  */
-function saveExistingUserCase(int $userId, ?string $description, ?int $problemTypeId, ?array $location, string $sessionId): array
-{
+function saveExistingUserCase(
+    int $userId,
+    ?string $description,
+    ?int $problemTypeId,
+    string $sessionId,
+    ?int $preferredCenterId = null,
+    ?string $preferredCenterName = null
+): array {
     $pdo = getDB();
-    $resolvedCenter = resolveCenterAssignment($pdo, $userId, $location);
-
-    if (!empty($resolvedCenter['centerId'])) {
-        syncConsultanteLocationData($pdo, $userId, $resolvedCenter);
-    }
-
-    $lat = $location['latitude'] ?? null;
-    $lng = $location['longitude'] ?? null;
-    $acc = $location['accuracy'] ?? null;
+    $resolvedCenter = resolveCenterAssignment($pdo, $userId, $preferredCenterId, $preferredCenterName);
 
     $stmt = $pdo->prepare(
         "INSERT INTO cases
-            (consultante_id, center_id, user_latitude, user_longitude, location_accuracy_meters, problem_type_id, description, input_method, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'texto', 'ingresado', NOW())"
+            (consultante_id, center_id, problem_type_id, description, input_method, status, created_at)
+         VALUES (?, ?, ?, ?, 'texto', 'ingresado', NOW())"
     );
     $stmt->execute([
         $userId,
         $resolvedCenter['centerId'],
-        $lat,
-        $lng,
-        $acc,
         $problemTypeId,
         $description ?? '',
     ]);
@@ -888,7 +1389,6 @@ function saveExistingUserCase(int $userId, ?string $description, ?int $problemTy
         'caseId' => $caseId,
         'centerId' => $resolvedCenter['centerId'],
         'centerName' => $resolvedCenter['centerName'],
-        'centerDistanceKm' => $resolvedCenter['distanceKm'],
     ];
 }
 
@@ -896,7 +1396,7 @@ function saveExistingUserCase(int $userId, ?string $description, ?int $problemTy
  * Crea un usuario nuevo + caso en una transacción.
  * Mapea campos del prompt (español) a columnas de BD (inglés).
  */
-function saveNewUserAndCase(array $userData, ?string $description, ?int $problemTypeId, ?array $location, string $sessionId): array
+function saveNewUserAndCase(array $userData, ?string $description, ?int $problemTypeId, string $sessionId): array
 {
     $pdo = getDB();
 
@@ -937,7 +1437,7 @@ function saveNewUserAndCase(array $userData, ?string $description, ?int $problem
             }
         }
 
-        $resolvedCenter = resolveCenterAssignment($pdo, $consultanteId ? (int)$consultanteId : null, null, $preferredCenterId, $preferredCenterName);
+        $resolvedCenter = resolveCenterAssignment($pdo, $consultanteId ? (int)$consultanteId : null, $preferredCenterId, $preferredCenterName);
         $resolvedZone = $resolvedCenter['centerZone'] ?? null;
 
         if (!$consultanteId) {
@@ -953,21 +1453,14 @@ function saveNewUserAndCase(array $userData, ?string $description, ?int $problem
         }
 
         // Crear caso
-        $lat = $location['latitude'] ?? null;
-        $lng = $location['longitude'] ?? null;
-        $acc = $location['accuracy'] ?? null;
-
         $stmt = $pdo->prepare(
             "INSERT INTO cases
-                (consultante_id, center_id, user_latitude, user_longitude, location_accuracy_meters, problem_type_id, description, input_method, status, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'texto', 'ingresado', NOW())"
+                (consultante_id, center_id, problem_type_id, description, input_method, status, created_at)
+             VALUES (?, ?, ?, ?, 'texto', 'ingresado', NOW())"
         );
         $stmt->execute([
             $consultanteId,
             $resolvedCenter['centerId'],
-            $lat,
-            $lng,
-            $acc,
             $problemTypeId,
             $description ?? '',
         ]);
@@ -988,7 +1481,6 @@ function saveNewUserAndCase(array $userData, ?string $description, ?int $problem
             'caseId' => $caseId,
             'centerId' => $resolvedCenter['centerId'],
             'centerName' => $resolvedCenter['centerName'],
-            'centerDistanceKm' => $resolvedCenter['distanceKm'],
         ];
 
     } catch (Exception $e) {
@@ -1016,9 +1508,10 @@ function syncConsultanteLocationData(PDO $pdo, int $userId, array $resolvedCente
 }
 
 /**
- * Determina el centro a asignar priorizando cercanía por geolocalización.
+ * Determina el centro a asignar, priorizando la elección explícita del usuario
+ * para este caso, y si no hay ninguna, el centro ya asociado a su cuenta.
  */
-function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location = null, ?int $preferredCenterId = null, ?string $preferredCenterName = null): array
+function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?int $preferredCenterId = null, ?string $preferredCenterName = null): array
 {
     if (!empty($preferredCenterId)) {
         $stmt = $pdo->prepare('SELECT id, name, zone FROM centers WHERE id = ? LIMIT 1');
@@ -1029,7 +1522,6 @@ function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location
                 'centerId' => (int)$preferred['id'],
                 'centerName' => $preferred['name'] ?? null,
                 'centerZone' => $preferred['zone'] ?? null,
-                'distanceKm' => null,
                 'source' => 'manual_center',
             ];
         }
@@ -1045,7 +1537,6 @@ function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location
                     'centerId' => (int)$center['id'],
                     'centerName' => $center['name'] ?? null,
                     'centerZone' => $center['zone'] ?? null,
-                    'distanceKm' => null,
                     'source' => 'manual_center_name',
                 ];
             }
@@ -1067,7 +1558,6 @@ function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location
                 'centerId' => (int)$userCenter['id'],
                 'centerName' => $userCenter['name'] ?? null,
                 'centerZone' => $userCenter['zone'] ?? null,
-                'distanceKm' => null,
                 'source' => 'user_center',
             ];
         }
@@ -1079,7 +1569,6 @@ function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location
             'centerId' => (int)$fallback['id'],
             'centerName' => $fallback['name'] ?? null,
             'centerZone' => $fallback['zone'] ?? null,
-            'distanceKm' => null,
             'source' => 'fallback',
         ];
     }
@@ -1088,7 +1577,6 @@ function resolveCenterAssignment(PDO $pdo, ?int $consultanteId, ?array $location
         'centerId' => null,
         'centerName' => null,
         'centerZone' => null,
-        'distanceKm' => null,
         'source' => null,
     ];
 }
@@ -1104,7 +1592,7 @@ function getCentersForPrompt(): array
     }
 
     $pdo = getDB();
-    $stmt = $pdo->query('SELECT id, name, address, zone, latitude, longitude FROM centers ORDER BY name ASC');
+    $stmt = $pdo->query('SELECT id, name, address, zone FROM centers ORDER BY name ASC');
     $rows = $stmt->fetchAll() ?: [];
 
     $cache = array_map(static function (array $row): array {
@@ -1113,8 +1601,6 @@ function getCentersForPrompt(): array
             'name' => (string)$row['name'],
             'address' => (string)($row['address'] ?? ''),
             'zone' => (string)($row['zone'] ?? ''),
-            'latitude' => isset($row['latitude']) ? (float)$row['latitude'] : null,
-            'longitude' => isset($row['longitude']) ? (float)$row['longitude'] : null,
         ];
     }, $rows);
 
@@ -1156,26 +1642,14 @@ function resolveProblemTypeId(?string $categoria, ?string $descripcion): ?int
         return null;
     }
 
-    $normalize = static function (?string $value): string {
-        $value = trim((string)$value);
-        if ($value === '') {
-            return '';
-        }
-        $value = mb_strtolower($value, 'UTF-8');
-        $value = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $value) ?: $value;
-        $value = preg_replace('/[^a-z0-9\s]/', ' ', $value);
-        $value = preg_replace('/\s+/', ' ', $value);
-        return trim($value);
-    };
-
-    $cat = $normalize($categoria);
-    $desc = $normalize($descripcion);
+    $cat = normalizeForMatch($categoria);
+    $desc = normalizeForMatch($descripcion);
 
     // 1) Match directo por categoria contra name/description
     if ($cat !== '') {
         foreach ($types as $type) {
-            $nameNorm = $normalize($type['name']);
-            $descNorm = $normalize($type['description']);
+            $nameNorm = normalizeForMatch($type['name']);
+            $descNorm = normalizeForMatch($type['description']);
             if ($cat === $nameNorm || ($nameNorm !== '' && str_contains($cat, $nameNorm)) || ($cat !== '' && str_contains($nameNorm, $cat))) {
                 return (int)$type['id'];
             }
@@ -1188,7 +1662,7 @@ function resolveProblemTypeId(?string $categoria, ?string $descripcion): ?int
     // 2) Match por palabras de la descripcion contra el nombre del tipo
     if ($desc !== '') {
         foreach ($types as $type) {
-            $nameNorm = $normalize($type['name']);
+            $nameNorm = normalizeForMatch($type['name']);
             if ($nameNorm !== '' && str_contains($desc, $nameNorm)) {
                 return (int)$type['id'];
             }
@@ -1197,7 +1671,7 @@ function resolveProblemTypeId(?string $categoria, ?string $descripcion): ?int
 
     // 3) Fallback a "Otro" si existe
     foreach ($types as $type) {
-        if ($normalize($type['name']) === 'otro') {
+        if (normalizeForMatch($type['name']) === 'otro') {
             return (int)$type['id'];
         }
     }
